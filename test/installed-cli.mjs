@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -66,6 +73,7 @@ if (args[0] === "app-server") {
 
   const targetDirectory = path.join(root, "target-project");
   mkdirSync(targetDirectory);
+  const canonicalTargetDirectory = realpathSync(targetDirectory);
   const binName = process.platform === "win32" ? "codex-watchdog.cmd" : "codex-watchdog";
   const installedBin = path.join(installRoot, "node_modules", ".bin", binName);
   const cliResult = await run(installedBin, ["--version"], {
@@ -79,10 +87,10 @@ if (args[0] === "app-server") {
   assert.equal(cliResult.code, 0, cliResult.stderr);
 
   const invocation = JSON.parse(readFileSync(recordPath, "utf8"));
-  assert.equal(invocation.cwd, targetDirectory);
+  assert.equal(invocation.cwd, canonicalTargetDirectory);
   assert.equal(invocation.args[0], "--remote");
   assert.match(invocation.args[1], /^ws:\/\/127\.0\.0\.1:\d+$/);
-  assert.deepEqual(invocation.args.slice(2), ["-C", targetDirectory, "--version"]);
+  assert.deepEqual(invocation.args.slice(2), ["-C", canonicalTargetDirectory, "--version"]);
   process.stdout.write("installed codex-watchdog command forwarded cwd and arguments correctly\n");
 } finally {
   rmSync(root, { recursive: true, force: true });
