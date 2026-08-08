@@ -1058,3 +1058,67 @@ test("gates compacted goal recovery", async () => {
     "thread/goal/set",
   ]);
 });
+
+test("does not retry stale compact recovery after a new turn starts during goal update", async () => {
+  const goalSet = deferred();
+  const { controller, timers, requests, logs } = createHarness({
+    goalSetResponses: [goalSet.promise],
+  });
+  controller.handleNotification(contextWindowExceeded());
+  await timers[0].callback();
+  controller.handleNotification({
+    method: "thread/compacted",
+    params: { threadId: "thread-1", turnId: "turn-context" },
+  });
+
+  const recovery = timers[2].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.at(-1).method, "thread/goal/set");
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-manual" } },
+  });
+  const error = new Error("503 Service Unavailable");
+  error.code = 503;
+  goalSet.reject(error);
+  await recovery;
+
+  assert.equal(timers.length, 3);
+  assert.equal(
+    logs.some(({ message }) => message.includes("Failed to resume compacted goal")),
+    false,
+  );
+
+  const nextError = terminal503();
+  nextError.params.turnId = "turn-manual";
+  const nextBlocked = blockedGoal();
+  nextBlocked.params.turnId = "turn-manual";
+  controller.handleNotification(nextError);
+  controller.handleNotification(nextBlocked);
+  assert.equal(timers.length, 4);
+  assert.equal(timers[3].delayMs, 30_000);
+});
+
+test("uses refreshed goal eligibility after model recovery", async () => {
+  const gate = deferred();
+  const { controller, timers, requests } = createHarness({
+    goalGetResponses: [
+      { goal: { threadId: "thread-1", status: "blocked" } },
+      { goal: { threadId: "thread-1", status: "paused" } },
+    ],
+    recoveryGate: { waitForRecovery: () => gate.promise },
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(blockedGoal());
+
+  const recovery = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests.map(({ method }) => method), ["thread/goal/get"]);
+  gate.resolve();
+  await recovery;
+
+  assert.deepEqual(requests.map(({ method }) => method), [
+    "thread/goal/get",
+    "thread/goal/get",
+  ]);
+});

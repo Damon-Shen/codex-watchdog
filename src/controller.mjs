@@ -10,6 +10,7 @@ const STOPPED_GOAL_STATUSES = new Set([
   "complete",
 ]);
 const INTERRUPTABLE_GOAL_STATUSES = new Set(["active"]);
+const BLOCKED_GOAL_STATUSES = new Set(["blocked"]);
 const RESUMABLE_GOAL_STATUSES = new Set(["active", "blocked"]);
 
 function newThreadState() {
@@ -22,6 +23,7 @@ function newThreadState() {
     pending: null,
     activeTurnId: null,
     interruptingTurnId: null,
+    turnGeneration: 0,
     attempt: 0,
   };
 }
@@ -119,6 +121,7 @@ export class GoalWatchdogController {
         return;
       }
     }
+    const startsNewTurn = state.activeTurnId !== turnId;
     if (state.pending && state.pending.turnId !== turnId) {
       this.#cancelPending(
         state,
@@ -136,6 +139,7 @@ export class GoalWatchdogController {
       state.interruptingTurnId = null;
     }
     state.activeTurnId = turnId;
+    if (startsNewTurn) state.turnGeneration += 1;
   }
 
   #handleTurnProgress(method, params) {
@@ -374,29 +378,31 @@ export class GoalWatchdogController {
   }
 
   async #resumeAfterCompaction(threadId, turnId, state, pending) {
-    let resumeSent = false;
+    let actionSent = false;
+    let turnGeneration = null;
 
     try {
       const recovery = await this.#resolveRecoveryAction(
         threadId,
         state,
         pending,
-        new Set(["blocked"]),
+        BLOCKED_GOAL_STATUSES,
       );
       if (!recovery) return;
+      turnGeneration = state.turnGeneration;
       this.#releasePending(state, pending);
       if (recovery.action === "resume-goal") {
-        resumeSent = true;
+        actionSent = true;
         await this.sendRequest("thread/goal/set", { threadId, status: "active" });
       }
-      if (this.threads.get(threadId) !== state) return;
+      if (!this.#isCurrentTurnGeneration(threadId, state, turnGeneration)) return;
       state.attempt = 0;
       this.logger.info(`Compacted context and resumed goal ${threadId}`);
     } catch (error) {
-      if (!resumeSent) {
+      if (!actionSent) {
         if (!this.#isCurrentPending(threadId, state, pending)) return;
         this.#releasePending(state, pending);
-      } else if (this.threads.get(threadId) !== state) {
+      } else if (!this.#isCurrentTurnGeneration(threadId, state, turnGeneration)) {
         return;
       }
       const classification = classifyRecoveryRequestError(error);
@@ -531,7 +537,7 @@ export class GoalWatchdogController {
 
     try {
       const resumableStatuses = requireBlocked
-        ? new Set(["blocked"])
+        ? BLOCKED_GOAL_STATUSES
         : RESUMABLE_GOAL_STATUSES;
       const recovery = await this.#resolveRecoveryAction(
         threadId,
@@ -590,6 +596,13 @@ export class GoalWatchdogController {
       !pending.cancelled &&
       state.pending === pending &&
       this.threads.get(threadId) === state
+    );
+  }
+
+  #isCurrentTurnGeneration(threadId, state, turnGeneration) {
+    return (
+      this.threads.get(threadId) === state &&
+      state.turnGeneration === turnGeneration
     );
   }
 
