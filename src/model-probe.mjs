@@ -9,7 +9,11 @@ export function readModelStatus(payload, targetModel) {
 }
 
 export class ModelRecoveryProbe {
-  #state = 'unknown';
+  #phase = 'idle';
+  #cycle = 0;
+  #sawFalse = false;
+  #previousWasTrue = false;
+  #outcome = null;
   #timer = null;
   #started = false;
   #closed = false;
@@ -44,11 +48,12 @@ export class ModelRecoveryProbe {
     this.logger = logger;
   }
 
-  async checkNow() {
-    if (this.#closed) return null;
+  async checkNow(cycle = this.#cycle) {
+    if (this.#closed || cycle !== this.#cycle) return null;
 
     const controller = new AbortController();
-    this.#activeRequests.add(controller);
+    const request = { controller, cycle };
+    this.#activeRequests.add(request);
     try {
       const response = await this.fetchImpl(this.url, {
         method: 'GET',
@@ -57,35 +62,51 @@ export class ModelRecoveryProbe {
           AbortSignal.timeout(this.requestTimeoutMs)
         ])
       });
-      if (this.#closed) return null;
+      if (this.#closed || cycle !== this.#cycle) return null;
       if (!response.ok) throw new Error(`HTTP request failed: ${response.status ?? 'unknown status'}`);
 
       const payload = await response.json();
-      if (this.#closed) return null;
+      if (this.#closed || cycle !== this.#cycle) return null;
       const status = readModelStatus(payload, this.targetModel);
       if (typeof status !== 'boolean') throw new Error('model status is unknown');
 
-      this.#recordSample(status);
+      this.#recordSample(status, cycle);
       return status;
     } catch (error) {
-      if (this.#closed) return null;
+      if (this.#closed || cycle !== this.#cycle) return null;
+      this.#recordUnknown(cycle);
       const message = error instanceof Error ? error.message : String(error);
       this.logger?.warn?.(`Model probe check failed for ${this.targetModel}: ${message}`);
       return null;
     } finally {
-      this.#activeRequests.delete(controller);
+      this.#activeRequests.delete(request);
     }
   }
 
   start() {
     if (this.#started || this.#closed) return;
     this.#started = true;
-    void this.#poll();
+  }
+
+  beginRecoveryCheck() {
+    if (this.#closed) return;
+    if (!this.#started) this.start();
+    this.#cycle += 1;
+    this.#phase = 'confirming';
+    this.#sawFalse = false;
+    this.#previousWasTrue = false;
+    this.#outcome = null;
+    if (this.#timer !== null) {
+      this.cancel(this.#timer);
+      this.#timer = null;
+    }
+    for (const request of this.#activeRequests) request.controller.abort();
+    void this.#poll(this.#cycle);
   }
 
   waitForRecovery() {
     if (this.#closed) return Promise.reject(new Error('Model recovery probe is closed'));
-    if (this.#state === 'recovered') return Promise.resolve();
+    if (this.#phase === 'ready') return Promise.resolve(this.#outcome);
     return new Promise((resolve, reject) => {
       this.#waiters.add({ resolve, reject });
     });
@@ -94,7 +115,7 @@ export class ModelRecoveryProbe {
   close() {
     if (this.#closed) return;
     this.#closed = true;
-    for (const controller of this.#activeRequests) controller.abort();
+    for (const request of this.#activeRequests) request.controller.abort();
     this.#activeRequests.clear();
     if (this.#timer !== null) {
       this.cancel(this.#timer);
@@ -105,27 +126,37 @@ export class ModelRecoveryProbe {
     this.#waiters.clear();
   }
 
-  async #poll() {
-    await this.checkNow();
-    if (this.#closed) return;
+  async #poll(cycle) {
+    if (this.#closed || cycle !== this.#cycle || this.#phase !== 'confirming') return;
+    await this.checkNow(cycle);
+    if (this.#closed || cycle !== this.#cycle || this.#phase !== 'confirming') return;
     this.#timer = this.schedule(() => {
       this.#timer = null;
-      void this.#poll();
+      void this.#poll(cycle);
     }, this.intervalMs);
   }
 
-  #recordSample(status) {
-    if (this.#closed) return;
+  #recordSample(status, cycle) {
+    if (this.#closed || cycle !== this.#cycle || this.#phase !== 'confirming') return;
     if (status === false) {
-      this.#state = 'down';
+      this.#sawFalse = true;
+      this.#previousWasTrue = false;
       return;
     }
-    if (this.#state === 'down') {
-      this.#state = 'recovered';
-      for (const waiter of this.#waiters) waiter.resolve();
-      this.#waiters.clear();
-      return;
-    }
-    if (this.#state === 'unknown') this.#state = 'healthy-unarmed';
+    if (this.#sawFalse) return this.#markReady('recovered-after-false');
+    if (this.#previousWasTrue) return this.#markReady('confirmed-healthy');
+    this.#previousWasTrue = true;
+  }
+
+  #recordUnknown(cycle) {
+    if (this.#closed || cycle !== this.#cycle || this.#phase !== 'confirming') return;
+    if (!this.#sawFalse) this.#previousWasTrue = false;
+  }
+
+  #markReady(outcome) {
+    this.#phase = 'ready';
+    this.#outcome = outcome;
+    for (const waiter of this.#waiters) waiter.resolve(outcome);
+    this.#waiters.clear();
   }
 }
