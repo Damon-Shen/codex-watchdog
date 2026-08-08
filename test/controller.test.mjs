@@ -107,12 +107,12 @@ function createHarness({
   return { controller, requests, timers, cancelled, goals, logs };
 }
 
-function terminal503() {
+function terminal503(turnId = "turn-1") {
   return {
     method: "error",
     params: {
       threadId: "thread-1",
-      turnId: "turn-1",
+      turnId,
       willRetry: false,
       error: {
         message: "service unavailable",
@@ -121,6 +121,14 @@ function terminal503() {
       },
     },
   };
+}
+
+function terminal429(turnId = "turn-1") {
+  const notification = terminal503();
+  notification.params.turnId = turnId;
+  notification.params.error.message = "too many requests";
+  notification.params.error.codexErrorInfo.httpConnectionFailed.httpStatusCode = 429;
+  return notification;
 }
 
 function retrying503() {
@@ -181,6 +189,547 @@ function completedItem(turnId = "turn-1") {
     },
   };
 }
+
+test("begins recovery check immediately once per transient turn", () => {
+  let checks = 0;
+  const { controller } = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck: () => {
+        checks += 1;
+      },
+      waitForRecovery: async () => {},
+    },
+  });
+
+  controller.handleNotification(terminal503());
+  assert.equal(checks, 1);
+
+  controller.handleNotification(terminal503());
+  assert.equal(checks, 1);
+
+  controller.handleNotification({
+    method: "turn/started",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-2", status: "inProgress" },
+    },
+  });
+  const nextError = terminal503();
+  nextError.params.turnId = "turn-2";
+  controller.handleNotification(nextError);
+
+  assert.equal(checks, 2);
+});
+
+test("does not restart recovery check after same-turn progress clears classification", () => {
+  let checks = 0;
+  const { controller } = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck: () => {
+        checks += 1;
+      },
+    },
+  });
+
+  controller.handleNotification(retrying503());
+  controller.handleNotification(completedItem());
+  assert.equal(
+    controller.threads.get("thread-1").transientTurns.has("turn-1"),
+    false,
+  );
+
+  controller.handleNotification(retrying503());
+  assert.equal(checks, 1);
+});
+
+test("does not restart recovery check after same-turn recovery clears classification", async () => {
+  let checks = 0;
+  const { controller, timers } = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck: () => {
+        checks += 1;
+      },
+      waitForRecovery: async () => "confirmed-healthy",
+    },
+  });
+
+  controller.handleNotification(terminal503());
+  controller.handleNotification(blockedGoal());
+  await timers[0].callback();
+  assert.equal(
+    controller.threads.get("thread-1").transientTurns.has("turn-1"),
+    false,
+  );
+
+  controller.handleNotification(terminal503());
+  assert.equal(checks, 1);
+});
+
+test("begins recovery check only for accepted context exhaustion", () => {
+  let acceptedChecks = 0;
+  const accepted = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck: () => {
+        acceptedChecks += 1;
+      },
+    },
+  });
+
+  accepted.controller.handleNotification(contextWindowExceeded());
+  accepted.controller.handleNotification(contextWindowExceeded());
+  assert.equal(acceptedChecks, 1);
+
+  let staleChecks = 0;
+  const stale = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck: () => {
+        staleChecks += 1;
+      },
+    },
+  });
+  stale.controller.handleNotification({
+    method: "turn/started",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-new", status: "inProgress" },
+    },
+  });
+  stale.controller.handleNotification(contextWindowExceeded());
+
+  assert.equal(staleChecks, 0);
+});
+
+test("shares one recovery check for transient and context errors in the same turn", () => {
+  let checks = 0;
+  const { controller } = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck: () => {
+        checks += 1;
+      },
+    },
+  });
+
+  controller.handleNotification(terminal503("turn-context"));
+  controller.handleNotification(contextWindowExceeded());
+
+  assert.equal(checks, 1);
+  assert.equal(controller.threads.get("thread-1").pending.kind, "compact");
+});
+
+test("ignores delayed errors for completed turns after a newer turn finishes", () => {
+  let checks = 0;
+  const { controller } = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck: () => {
+        checks += 1;
+      },
+    },
+  });
+
+  controller.handleNotification(terminal429("turn-a"));
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-a", status: "interrupted", error: null },
+    },
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-b" } },
+  });
+  controller.handleNotification(terminal429("turn-b"));
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-b", status: "interrupted", error: null },
+    },
+  });
+
+  controller.handleNotification(terminal429("turn-a"));
+  const delayedContext = contextWindowExceeded();
+  delayedContext.params.turnId = "turn-a";
+  controller.handleNotification(delayedContext);
+
+  const state = controller.threads.get("thread-1");
+  assert.equal(checks, 2);
+  assert.equal(state.consecutive429Turns, 2);
+  assert.equal(state.lastFailureTurnId, "turn-b");
+  assert.equal(state.lastFailureWas429, true);
+  assert.equal(state.pending, null);
+});
+
+test("keeps successful-turn tombstones when normal turn state is cleared", () => {
+  let checks = 0;
+  const { controller } = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck: () => {
+        checks += 1;
+      },
+    },
+  });
+
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-finished", status: "completed", error: null },
+    },
+  });
+  controller.handleNotification(terminal503("turn-finished"));
+  const delayedContext = contextWindowExceeded();
+  delayedContext.params.turnId = "turn-finished";
+  controller.handleNotification(delayedContext);
+
+  const state = controller.threads.get("thread-1");
+  assert.equal(checks, 0);
+  assert.equal(state.consecutive429Turns, 0);
+  assert.equal(state.lastFailureTurnId, null);
+  assert.equal(state.lastFailureWas429, false);
+  assert.equal(state.pending, null);
+});
+
+test("counts duplicate 429 notifications once for a turn", () => {
+  const { controller } = createHarness();
+
+  controller.handleNotification(terminal429());
+  controller.handleNotification(terminal429());
+
+  const state = controller.threads.get("thread-1");
+  assert.equal(state.consecutive429Turns, 1);
+  assert.equal(state.lastFailureTurnId, "turn-1");
+  assert.equal(state.lastFailureWas429, true);
+});
+
+test("increments the 429 streak for distinct turns", () => {
+  const { controller } = createHarness();
+
+  controller.handleNotification(terminal429());
+  controller.handleNotification({
+    method: "turn/started",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-2", status: "inProgress" },
+    },
+  });
+  controller.handleNotification(terminal429("turn-2"));
+
+  const state = controller.threads.get("thread-1");
+  assert.equal(state.consecutive429Turns, 2);
+  assert.equal(state.lastFailureTurnId, "turn-2");
+  assert.equal(state.lastFailureWas429, true);
+});
+
+test("resets 429 tracking after a successful turn", () => {
+  const { controller } = createHarness();
+  controller.handleNotification(terminal429());
+
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "completed", error: null },
+    },
+  });
+
+  const state = controller.threads.get("thread-1");
+  assert.equal(state.consecutive429Turns, 0);
+  assert.equal(state.lastFailureTurnId, null);
+  assert.equal(state.lastFailureWas429, false);
+});
+
+test("resets 429 tracking while successful context recovery remains pending", () => {
+  const { controller, timers } = createHarness();
+  controller.handleNotification(contextWindowExceeded());
+  controller.handleNotification(terminal429("turn-429"));
+
+  const state = controller.threads.get("thread-1");
+  const pending = state.pending;
+  assert.equal(state.consecutive429Turns, 1);
+  assert.equal(pending.kind, "compact");
+
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-context", status: "completed", error: null },
+    },
+  });
+
+  assert.equal(state.consecutive429Turns, 0);
+  assert.equal(state.lastFailureTurnId, null);
+  assert.equal(state.lastFailureWas429, false);
+  assert.equal(state.pending, pending);
+  assert.equal(pending.cancelled, false);
+  assert.equal(timers[0].cancelled, false);
+});
+
+test("resets the 429 streak after a non-429 transient failure", () => {
+  const { controller } = createHarness();
+
+  controller.handleNotification(terminal429());
+  controller.handleNotification({
+    method: "turn/started",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-2", status: "inProgress" },
+    },
+  });
+  const nextError = terminal503("turn-2");
+  controller.handleNotification(nextError);
+
+  const state = controller.threads.get("thread-1");
+  assert.equal(state.consecutive429Turns, 0);
+  assert.equal(state.lastFailureTurnId, "turn-2");
+  assert.equal(state.lastFailureWas429, false);
+});
+
+test("context exhaustion breaks the 429 streak before healthy compaction recovery", async () => {
+  const { controller, timers, requests, logs } = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck() {},
+      waitForRecovery: async () => "confirmed-healthy",
+    },
+  });
+
+  controller.handleNotification(terminal429("turn-1"));
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-2" } },
+  });
+  controller.handleNotification(terminal429("turn-2"));
+  const contextError = contextWindowExceeded();
+  contextError.params.turnId = "turn-2";
+  controller.handleNotification(contextError);
+
+  const state = controller.threads.get("thread-1");
+  assert.equal(state.consecutive429Turns, 0);
+  assert.equal(state.lastFailureTurnId, "turn-2");
+  assert.equal(state.lastFailureWas429, false);
+  assert.equal(state.transientTurns.has("turn-2"), false);
+
+  await timers[0].callback();
+  controller.handleNotification({
+    method: "thread/compacted",
+    params: { threadId: "thread-1", turnId: "turn-2" },
+  });
+  await timers.at(-1).callback();
+
+  assert.equal(
+    requests.filter(({ method }) => method === "thread/goal/set").length,
+    1,
+  );
+  assert.equal(
+    logs.some(({ message }) => message.includes("possible daily limit")),
+    false,
+  );
+});
+
+for (const { name, secondOutcome, expectedStarts } of [
+  {
+    name: "stops a second-turn 429 when the relay is confirmed healthy",
+    secondOutcome: "confirmed-healthy",
+    expectedStarts: 1,
+  },
+  {
+    name: "continues a second-turn 429 after observing the relay down",
+    secondOutcome: "recovered-after-false",
+    expectedStarts: 2,
+  },
+]) {
+  test(name, async () => {
+    const outcomes = ["confirmed-healthy", secondOutcome];
+    const { controller, timers, requests, logs } = createHarness({
+      goalStatus: null,
+      recoveryGate: {
+        beginRecoveryCheck() {},
+        waitForRecovery: async () => outcomes.shift(),
+      },
+    });
+
+    controller.handleNotification(terminal429("turn-1"));
+    controller.handleNotification(failedTurn("turn-1"));
+    await timers[0].callback();
+    controller.handleNotification({
+      method: "turn/started",
+      params: { threadId: "thread-1", turn: { id: "turn-2" } },
+    });
+    controller.handleNotification(terminal429("turn-2"));
+    controller.handleNotification(failedTurn("turn-2"));
+    await timers[1].callback();
+
+    assert.equal(
+      requests.filter(({ method }) => method === "turn/start").length,
+      expectedStarts,
+    );
+    assert.equal(
+      logs.some(({ message }) => message.includes("possible daily limit")),
+      secondOutcome === "confirmed-healthy",
+    );
+  });
+}
+
+for (const { name, secondOutcome, expectedGoalSets } of [
+  {
+    name: "stops a second goal-mode 429 when the relay is confirmed healthy",
+    secondOutcome: "confirmed-healthy",
+    expectedGoalSets: 1,
+  },
+  {
+    name: "resumes a second goal-mode 429 after observing the relay down",
+    secondOutcome: "recovered-after-false",
+    expectedGoalSets: 2,
+  },
+]) {
+  test(name, async () => {
+    const cycleOutcomes = ["confirmed-healthy", secondOutcome];
+    let cycleOutcome = null;
+    const { controller, timers, requests, goals, logs } = createHarness({
+      recoveryGate: {
+        beginRecoveryCheck() {
+          cycleOutcome = cycleOutcomes.shift();
+        },
+        waitForRecovery: async () => cycleOutcome,
+      },
+    });
+
+    controller.handleNotification(terminal429("turn-1"));
+    controller.handleNotification(blockedGoal());
+    await timers[0].callback();
+
+    goals.set("thread-1", { status: "blocked" });
+    controller.handleNotification({
+      method: "turn/started",
+      params: { threadId: "thread-1", turn: { id: "turn-2" } },
+    });
+    controller.handleNotification(terminal429("turn-2"));
+    const secondBlocked = blockedGoal();
+    secondBlocked.params.turnId = "turn-2";
+    controller.handleNotification(secondBlocked);
+    await timers[1].callback();
+
+    assert.equal(
+      requests.filter(({ method }) => method === "thread/goal/set").length,
+      expectedGoalSets,
+    );
+    assert.equal(
+      logs.some(({ message }) => message.includes("possible daily limit")),
+      secondOutcome === "confirmed-healthy",
+    );
+  });
+}
+
+test("does not suppress consecutive 429 recovery without a gate outcome", async () => {
+  const { controller, timers, requests, logs } = createHarness();
+
+  controller.handleNotification(terminal429("turn-1"));
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-2" } },
+  });
+  controller.handleNotification(terminal429("turn-2"));
+  const secondBlocked = blockedGoal();
+  secondBlocked.params.turnId = "turn-2";
+  controller.handleNotification(secondBlocked);
+  await timers[0].callback();
+
+  assert.equal(
+    requests.filter(({ method }) => method === "thread/goal/set").length,
+    1,
+  );
+  assert.equal(
+    logs.some(({ message }) => message.includes("possible daily limit")),
+    false,
+  );
+});
+
+test("keeps the original 429 classification until a retrying goal action completes", async () => {
+  const error = new Error("503 Service Unavailable");
+  error.code = 503;
+  let checks = 0;
+  let waits = 0;
+  const { controller, timers, requests, logs } = createHarness({
+    goalSetResponses: [error],
+    recoveryGate: {
+      beginRecoveryCheck() {
+        checks += 1;
+      },
+      waitForRecovery: async () => {
+        waits += 1;
+        return "confirmed-healthy";
+      },
+    },
+  });
+
+  controller.handleNotification(terminal429());
+  controller.handleNotification(blockedGoal());
+
+  await timers[0].callback();
+  assert.equal(
+    controller.threads.get("thread-1").transientTurns.get("turn-1").statusCode,
+    429,
+  );
+
+  await timers[1].callback();
+  assert.equal(
+    requests.filter(({ method }) => method === "thread/goal/set").length,
+    2,
+  );
+  assert.equal(
+    controller.threads.get("thread-1").transientTurns.has("turn-1"),
+    false,
+  );
+  assert.equal(checks, 1);
+  assert.equal(waits, 2);
+  assert.equal(
+    logs.some(({ message }) => message.includes("possible daily limit")),
+    false,
+  );
+});
+
+test("keeps the original 429 classification after interrupting a retrying turn", async () => {
+  const { controller, timers, requests, logs } = createHarness({
+    goalStatus: null,
+    interruptAfterMs: 10,
+    recoveryGate: {
+      beginRecoveryCheck() {},
+      waitForRecovery: async () => "confirmed-healthy",
+    },
+  });
+
+  controller.handleNotification(terminal429("turn-1"));
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-2" } },
+  });
+  const retrying429 = terminal429("turn-2");
+  retrying429.params.willRetry = true;
+  controller.handleNotification(retrying429);
+
+  await timers[0].callback();
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-2", status: "interrupted", error: null },
+    },
+  });
+  assert.equal(
+    controller.threads.get("thread-1").transientTurns.get("turn-2").statusCode,
+    429,
+  );
+
+  await timers[1].callback();
+  assert.equal(
+    requests.some(({ method }) => method === "turn/start"),
+    false,
+  );
+  assert.equal(
+    logs.some(({ message }) => message.includes("possible daily limit")),
+    true,
+  );
+});
 
 test("correlates terminal error and blocked goal in either event order", () => {
   for (const events of [

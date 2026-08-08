@@ -36,11 +36,16 @@ function newThreadState() {
     interruptAttempts: new Set(),
     compactionAttempts: new Set(),
     compactedTurns: new Set(),
+    finishedTurns: new Set(),
     pending: null,
     activeTurnId: null,
     interruptingTurnId: null,
     turnGeneration: 0,
     attempt: 0,
+    consecutive429Turns: 0,
+    lastFailureTurnId: null,
+    lastFailureWas429: false,
+    lastRecoveryCheckTurnId: null,
   };
 }
 
@@ -115,6 +120,12 @@ export class GoalWatchdogController {
     return state;
   }
 
+  #beginRecoveryCheckForTurn(state, turnId) {
+    if (state.lastRecoveryCheckTurnId === turnId) return;
+    state.lastRecoveryCheckTurnId = turnId;
+    this.recoveryGate?.beginRecoveryCheck?.();
+  }
+
   #handleTurnStarted(params) {
     const threadId = params.threadId;
     const turnId = params.turnId ?? params.turn?.id;
@@ -175,6 +186,10 @@ export class GoalWatchdogController {
       const { threadId, turnId } = message.params ?? {};
       if (threadId && turnId) {
         const state = this.#state(threadId);
+        if (state.finishedTurns.has(turnId)) {
+          this.logger.info(`Ignored context exhaustion for finished turn ${threadId}/${turnId}`);
+          return;
+        }
         if (
           state.compactionAttempts.has(turnId) ||
           (state.pending?.kind?.startsWith("compact") && state.pending.turnId === turnId)
@@ -186,6 +201,9 @@ export class GoalWatchdogController {
           this.logger.info(`Ignored stale context exhaustion for ${threadId}/${turnId}`);
           return;
         }
+        this.#recordFailureKind(state, turnId, classification);
+        state.transientTurns.delete(turnId);
+        this.#beginRecoveryCheckForTurn(state, turnId);
         this.#cancelPending(state);
         this.#scheduleCompaction(threadId, turnId, state);
       }
@@ -200,10 +218,16 @@ export class GoalWatchdogController {
     }
 
     const state = this.#state(threadId);
+    if (state.finishedTurns.has(turnId)) {
+      this.logger.info(`Ignored transient error for finished turn ${threadId}/${turnId}`);
+      return;
+    }
     if (state.activeTurnId && state.activeTurnId !== turnId) {
       this.logger.info(`Ignored stale transient error for ${threadId}/${turnId}`);
       return;
     }
+    this.#beginRecoveryCheckForTurn(state, turnId);
+    this.#recordFailureKind(state, turnId, classification);
     state.transientTurns.set(turnId, classification);
     this.logger.info(
       `Transient error for ${threadId}/${turnId}: ${classification.reason}`,
@@ -252,11 +276,12 @@ export class GoalWatchdogController {
     const turnId = params.turnId ?? turn?.id;
     if (!threadId || !turnId) return;
 
-    const state = this.threads.get(threadId);
-    if (!state) return;
+    const state = this.#state(threadId);
+    state.finishedTurns.add(turnId);
     if (state.activeTurnId === turnId) state.activeTurnId = null;
 
     if (turn?.status === "completed" && !turn.error) {
+      this.#reset429Tracking(state);
       if (state.pending?.kind?.startsWith("compact")) {
         this.logger.info(
           `Successful turn completed for ${threadId}; context recovery remains pending`,
@@ -275,7 +300,6 @@ export class GoalWatchdogController {
         (turn?.status === "completed" && Boolean(turn.error)));
     if (interruptionFinished) {
       state.interruptingTurnId = null;
-      state.transientTurns.delete(turnId);
       state.blockedTurns.delete(turnId);
       this.#scheduleResume(threadId, turnId, state, false);
       return;
@@ -313,6 +337,34 @@ export class GoalWatchdogController {
     state.interruptAttempts.clear();
     state.compactionAttempts.clear();
     state.compactedTurns.clear();
+  }
+
+  #reset429Tracking(state) {
+    state.consecutive429Turns = 0;
+    state.lastFailureTurnId = null;
+    state.lastFailureWas429 = false;
+  }
+
+  #recordFailureKind(state, turnId, classification) {
+    if (state.lastFailureTurnId === turnId) {
+      if (classification.statusCode !== 429) {
+        state.consecutive429Turns = 0;
+        state.lastFailureWas429 = false;
+      }
+      return;
+    }
+
+    state.lastFailureTurnId = turnId;
+    if (classification.statusCode === 429) {
+      state.consecutive429Turns = state.lastFailureWas429
+        ? state.consecutive429Turns + 1
+        : 1;
+      state.lastFailureWas429 = true;
+      return;
+    }
+
+    state.consecutive429Turns = 0;
+    state.lastFailureWas429 = false;
   }
 
   #scheduleCompaction(threadId, turnId, state, retry = false) {
@@ -433,6 +485,13 @@ export class GoalWatchdogController {
       if (!recovery.action) {
         this.logger.info(
           `Compacted context for ${threadId}; automatic recovery skipped`,
+        );
+        return;
+      }
+      if (this.#shouldStopForPossibleDailyLimit(state, turnId, recovery)) {
+        this.#resetThread(threadId);
+        this.logger.info(
+          `Stopped automatic recovery for ${threadId}/${turnId}: possible daily limit`,
         );
         return;
       }
@@ -558,22 +617,31 @@ export class GoalWatchdogController {
   }
 
   async #resolveRecoveryAction(threadId, state, pending, resumableStatuses) {
+    let gateOutcome = null;
     let response = await this.sendRequest("thread/goal/get", { threadId });
     if (!this.#isCurrentPending(threadId, state, pending)) return null;
     let goal = getExplicitGoal(response);
     let action = this.#selectRecoveryAction(goal, resumableStatuses);
     if (!action || !this.recoveryGate) {
-      return { action, status: goal?.status };
+      return { action, status: goal?.status, gateOutcome };
     }
 
     this.logger.info(`Waiting for model recovery before recovering thread ${threadId}`);
-    await this.recoveryGate.waitForRecovery();
+    gateOutcome = await this.recoveryGate.waitForRecovery();
     if (!this.#isCurrentPending(threadId, state, pending)) return null;
     response = await this.sendRequest("thread/goal/get", { threadId });
     if (!this.#isCurrentPending(threadId, state, pending)) return null;
     goal = getExplicitGoal(response);
     action = this.#selectRecoveryAction(goal, resumableStatuses);
-    return { action, status: goal?.status };
+    return { action, status: goal?.status, gateOutcome };
+  }
+
+  #shouldStopForPossibleDailyLimit(state, turnId, recovery) {
+    return (
+      recovery.gateOutcome === "confirmed-healthy" &&
+      state.consecutive429Turns >= 2 &&
+      state.transientTurns.get(turnId)?.statusCode === 429
+    );
   }
 
   async #sendRecoveryAction(action, threadId) {
@@ -642,6 +710,15 @@ export class GoalWatchdogController {
         return;
       }
 
+      if (this.#shouldStopForPossibleDailyLimit(state, turnId, recovery)) {
+        this.#releasePending(state, pending);
+        this.#resetThread(threadId);
+        this.logger.info(
+          `Stopped automatic recovery for ${threadId}/${turnId}: possible daily limit`,
+        );
+        return;
+      }
+
       recoveryAction = recovery.action;
       turnGeneration = state.turnGeneration;
       this.#releasePending(state, pending);
@@ -687,7 +764,6 @@ export class GoalWatchdogController {
         return;
       }
       state.attempt += 1;
-      state.transientTurns.set(turnId, { transient: true, reason: "resume-rpc-failed" });
       state.blockedTurns.add(turnId);
       this.#scheduleResume(threadId, turnId, state, requireBlocked);
     }
