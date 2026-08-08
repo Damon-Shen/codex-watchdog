@@ -34,6 +34,7 @@ export class GoalWatchdogController {
     schedule = setTimeout,
     cancel = clearTimeout,
     logger = console,
+    recoveryGate = null,
   }) {
     if (!Array.isArray(delaysMs) || delaysMs.length === 0) {
       throw new Error("delaysMs must contain at least one delay");
@@ -47,6 +48,7 @@ export class GoalWatchdogController {
     this.schedule = schedule;
     this.cancel = cancel;
     this.logger = logger;
+    this.recoveryGate = recoveryGate;
     this.threads = new Map();
   }
 
@@ -372,19 +374,31 @@ export class GoalWatchdogController {
   }
 
   async #resumeAfterCompaction(threadId, turnId, state, pending) {
+    let resumeSent = false;
+
     try {
-      const after = await this.sendRequest("thread/goal/get", { threadId });
-      if (!this.#isCurrentPending(threadId, state, pending)) return;
-      if (after?.goal?.status === "blocked") {
+      const recovery = await this.#resolveRecoveryAction(
+        threadId,
+        state,
+        pending,
+        new Set(["blocked"]),
+      );
+      if (!recovery) return;
+      this.#releasePending(state, pending);
+      if (recovery.action === "resume-goal") {
+        resumeSent = true;
         await this.sendRequest("thread/goal/set", { threadId, status: "active" });
       }
-      if (!this.#isCurrentPending(threadId, state, pending)) return;
-      this.#releasePending(state, pending);
+      if (this.threads.get(threadId) !== state) return;
       state.attempt = 0;
       this.logger.info(`Compacted context and resumed goal ${threadId}`);
     } catch (error) {
-      if (!this.#isCurrentPending(threadId, state, pending)) return;
-      this.#releasePending(state, pending);
+      if (!resumeSent) {
+        if (!this.#isCurrentPending(threadId, state, pending)) return;
+        this.#releasePending(state, pending);
+      } else if (this.threads.get(threadId) !== state) {
+        return;
+      }
       const classification = classifyRecoveryRequestError(error);
       this.logger.error(`Failed to resume compacted goal ${threadId}: ${classification.reason}`);
       if (!classification.retry) return;
@@ -463,6 +477,28 @@ export class GoalWatchdogController {
     this.#scheduleResume(threadId, turnId, state, true);
   }
 
+  #selectRecoveryAction(goal, resumableStatuses) {
+    if (goal == null) return this.recoveryGate ? "continue-turn" : null;
+    return resumableStatuses.has(goal.status) ? "resume-goal" : null;
+  }
+
+  async #resolveRecoveryAction(threadId, state, pending, resumableStatuses) {
+    let response = await this.sendRequest("thread/goal/get", { threadId });
+    if (!this.#isCurrentPending(threadId, state, pending)) return null;
+    let action = this.#selectRecoveryAction(response?.goal, resumableStatuses);
+    if (!action || !this.recoveryGate) {
+      return { action, status: response?.goal?.status };
+    }
+
+    this.logger.info(`Waiting for model recovery before recovering thread ${threadId}`);
+    await this.recoveryGate.waitForRecovery();
+    if (!this.#isCurrentPending(threadId, state, pending)) return null;
+    response = await this.sendRequest("thread/goal/get", { threadId });
+    if (!this.#isCurrentPending(threadId, state, pending)) return null;
+    action = this.#selectRecoveryAction(response?.goal, resumableStatuses);
+    return { action, status: response?.goal?.status };
+  }
+
   #scheduleResume(threadId, turnId, state, requireBlocked) {
     if (state.pending) return;
 
@@ -494,21 +530,25 @@ export class GoalWatchdogController {
     let resumeSent = false;
 
     try {
-      const response = await this.sendRequest("thread/goal/get", { threadId });
-      if (!this.#isCurrentPending(threadId, state, pending)) return;
+      const resumableStatuses = requireBlocked
+        ? new Set(["blocked"])
+        : RESUMABLE_GOAL_STATUSES;
+      const recovery = await this.#resolveRecoveryAction(
+        threadId,
+        state,
+        pending,
+        resumableStatuses,
+      );
+      if (!recovery) return;
       if (state.activeTurnId && state.activeTurnId !== turnId) {
         this.#releasePending(state, pending);
         return;
       }
 
-      const status = response?.goal?.status;
-      const canResume = requireBlocked
-        ? status === "blocked"
-        : RESUMABLE_GOAL_STATUSES.has(status);
-      if (!canResume) {
+      if (recovery.action !== "resume-goal") {
         this.#releasePending(state, pending);
         this.logger.info(
-          `Goal ${threadId} is ${status ?? "unknown"}; automatic resume skipped`,
+          `Goal ${threadId} is ${recovery.status ?? "unknown"}; automatic resume skipped`,
         );
         return;
       }

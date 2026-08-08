@@ -19,6 +19,7 @@ function createHarness({
   goalSetResponses = [],
   compactResponses = [],
   interruptAfterMs = 120_000,
+  recoveryGate = null,
 } = {}) {
   const requests = [];
   const timers = [];
@@ -29,6 +30,7 @@ function createHarness({
   const controller = new GoalWatchdogController({
     delaysMs: [30_000, 60_000, 120_000],
     interruptAfterMs,
+    recoveryGate,
     sendRequest: async (method, params) => {
       requests.push({ method, params });
       if (method === "thread/goal/get") {
@@ -167,6 +169,27 @@ test("checks the current goal before resuming", async () => {
     },
   ]);
   assert.equal(goals.get("thread-1").status, "active");
+});
+
+test("waits for model recovery before resuming a goal", async () => {
+  const gate = deferred();
+  const { controller, timers, requests } = createHarness({
+    recoveryGate: { waitForRecovery: () => gate.promise },
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(blockedGoal());
+
+  const recovery = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests.map(({ method }) => method), ["thread/goal/get"]);
+
+  gate.resolve();
+  await recovery;
+  assert.deepEqual(requests.map(({ method }) => method), [
+    "thread/goal/get",
+    "thread/goal/get",
+    "thread/goal/set",
+  ]);
 });
 
 test("stops ordinary goal recovery after a permanent goal lookup failure", async () => {
@@ -991,4 +1014,47 @@ test("retries a transient compact RPC failure from the 30 second delay", async (
 
   assert.equal(timers[1].delayMs, 30_000);
   await timers[1].callback();
+});
+
+test("cancels a gated goal resume when a new turn starts", async () => {
+  const gate = deferred();
+  const { controller, timers, requests } = createHarness({
+    recoveryGate: { waitForRecovery: () => gate.promise },
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(blockedGoal());
+  const recovery = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-manual" } },
+  });
+  gate.resolve();
+  await recovery;
+  assert.equal(requests.some(({ method }) => method === "thread/goal/set"), false);
+});
+
+test("gates compacted goal recovery", async () => {
+  const gate = deferred();
+  const { controller, timers, requests } = createHarness({
+    recoveryGate: { waitForRecovery: () => gate.promise },
+  });
+  controller.handleNotification(contextWindowExceeded());
+  await timers[0].callback();
+  controller.handleNotification({
+    method: "thread/compacted",
+    params: { threadId: "thread-1", turnId: "turn-context" },
+  });
+  const recovery = timers[2].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.some(({ method }) => method === "thread/goal/set"), false);
+  gate.resolve();
+  await recovery;
+  assert.deepEqual(requests.map(({ method }) => method), [
+    "thread/goal/get",
+    "thread/compact/start",
+    "thread/goal/get",
+    "thread/goal/get",
+    "thread/goal/set",
+  ]);
 });
