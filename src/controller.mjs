@@ -12,6 +12,22 @@ const STOPPED_GOAL_STATUSES = new Set([
 const INTERRUPTABLE_GOAL_STATUSES = new Set(["active"]);
 const BLOCKED_GOAL_STATUSES = new Set(["blocked"]);
 const RESUMABLE_GOAL_STATUSES = new Set(["active", "blocked"]);
+const DEFAULT_CONTINUE_PROMPT =
+  "继续完成刚才因上游服务故障而中断的任务。先检查当前状态，不要重复已完成的步骤。";
+
+function getExplicitGoal(response) {
+  if (
+    response === null ||
+    typeof response !== "object" ||
+    !Object.hasOwn(response, "goal")
+  ) {
+    return undefined;
+  }
+  const goal = response.goal;
+  if (goal === null) return null;
+  if (typeof goal !== "object" || Array.isArray(goal)) return undefined;
+  return goal;
+}
 
 function newThreadState() {
   return {
@@ -257,12 +273,34 @@ export class GoalWatchdogController {
       (turn?.status === "interrupted" ||
         turn?.status === "failed" ||
         (turn?.status === "completed" && Boolean(turn.error)));
-    if (!interruptionFinished) return;
+    if (interruptionFinished) {
+      state.interruptingTurnId = null;
+      state.transientTurns.delete(turnId);
+      state.blockedTurns.delete(turnId);
+      this.#scheduleResume(threadId, turnId, state, false);
+      return;
+    }
 
-    state.interruptingTurnId = null;
-    state.transientTurns.delete(turnId);
-    state.blockedTurns.delete(turnId);
-    this.#scheduleResume(threadId, turnId, state, false);
+    const terminalFailure =
+      turn?.status === "failed" ||
+      (turn?.status === "completed" && Boolean(turn.error));
+    if (
+      this.recoveryGate &&
+      state.transientTurns.has(turnId) &&
+      terminalFailure
+    ) {
+      if (
+        state.pending?.kind === "interrupt" &&
+        state.pending.turnId === turnId
+      ) {
+        this.#cancelPending(
+          state,
+          "interrupt",
+          `turn ${turnId} failed before interrupt`,
+        );
+      }
+      this.#scheduleResume(threadId, turnId, state, true);
+    }
   }
 
   #clearSuccessfulTurn(state) {
@@ -379,6 +417,7 @@ export class GoalWatchdogController {
 
   async #resumeAfterCompaction(threadId, turnId, state, pending) {
     let actionSent = false;
+    let recoveryAction = null;
     let turnGeneration = null;
 
     try {
@@ -391,13 +430,22 @@ export class GoalWatchdogController {
       if (!recovery) return;
       turnGeneration = state.turnGeneration;
       this.#releasePending(state, pending);
-      if (recovery.action === "resume-goal") {
-        actionSent = true;
-        await this.sendRequest("thread/goal/set", { threadId, status: "active" });
+      if (!recovery.action) {
+        this.logger.info(
+          `Compacted context for ${threadId}; automatic recovery skipped`,
+        );
+        return;
       }
+      recoveryAction = recovery.action;
+      actionSent = true;
+      await this.#sendRecoveryAction(recoveryAction, threadId);
       if (!this.#isCurrentTurnGeneration(threadId, state, turnGeneration)) return;
       state.attempt = 0;
-      this.logger.info(`Compacted context and resumed goal ${threadId}`);
+      if (recoveryAction === "resume-goal") {
+        this.logger.info(`Compacted context and resumed goal ${threadId}`);
+      } else {
+        this.logger.info(`Thread ${threadId} continued automatically`);
+      }
     } catch (error) {
       if (!actionSent) {
         if (!this.#isCurrentPending(threadId, state, pending)) return;
@@ -406,7 +454,20 @@ export class GoalWatchdogController {
         return;
       }
       const classification = classifyRecoveryRequestError(error);
-      this.logger.error(`Failed to resume compacted goal ${threadId}: ${classification.reason}`);
+      if (
+        actionSent &&
+        recoveryAction === "continue-turn" &&
+        classification.retry
+      ) {
+        this.logger.error(
+          `Thread ${threadId}/${turnId} recovery after compaction stopped: turn/start delivery is uncertain`,
+        );
+        this.#resetThread(threadId);
+        return;
+      }
+      this.logger.error(
+        `Thread ${threadId} recovery after compaction failed: ${classification.reason}`,
+      );
       if (!classification.retry) return;
       const delayMs = this.delaysMs[Math.min(state.attempt, this.delaysMs.length - 1)];
       this.#scheduleResumeAfterCompaction(threadId, turnId, state, delayMs);
@@ -451,11 +512,14 @@ export class GoalWatchdogController {
         return;
       }
 
-      const status = response?.goal?.status;
-      if (!INTERRUPTABLE_GOAL_STATUSES.has(status)) {
+      const goal = getExplicitGoal(response);
+      const canInterrupt =
+        INTERRUPTABLE_GOAL_STATUSES.has(goal?.status) ||
+        (goal === null && Boolean(this.recoveryGate));
+      if (!canInterrupt) {
         this.#releasePending(state, pending);
         this.logger.info(
-          `Goal ${threadId} is ${status ?? "unknown"}; automatic interrupt skipped`,
+          `Thread ${threadId} is not eligible for an automatic interrupt`,
         );
         return;
       }
@@ -467,10 +531,14 @@ export class GoalWatchdogController {
       await this.sendRequest("turn/interrupt", { threadId, turnId });
       this.logger.info(`Interrupted transient turn ${threadId}/${turnId}`);
     } catch (error) {
+      const classification = classifyRecoveryRequestError(error);
       if (!interruptSent) {
         if (!this.#isCurrentPending(threadId, state, pending)) return;
         this.#releasePending(state, pending);
-      } else if (state.interruptingTurnId === turnId) {
+      } else if (
+        !classification.retry &&
+        state.interruptingTurnId === turnId
+      ) {
         state.interruptingTurnId = null;
       }
       this.logger.error(`Failed to interrupt turn ${threadId}/${turnId}: ${error.message}`);
@@ -484,16 +552,18 @@ export class GoalWatchdogController {
   }
 
   #selectRecoveryAction(goal, resumableStatuses) {
-    if (goal == null) return this.recoveryGate ? "continue-turn" : null;
+    if (goal === null) return this.recoveryGate ? "continue-turn" : null;
+    if (goal === undefined) return null;
     return resumableStatuses.has(goal.status) ? "resume-goal" : null;
   }
 
   async #resolveRecoveryAction(threadId, state, pending, resumableStatuses) {
     let response = await this.sendRequest("thread/goal/get", { threadId });
     if (!this.#isCurrentPending(threadId, state, pending)) return null;
-    let action = this.#selectRecoveryAction(response?.goal, resumableStatuses);
+    let goal = getExplicitGoal(response);
+    let action = this.#selectRecoveryAction(goal, resumableStatuses);
     if (!action || !this.recoveryGate) {
-      return { action, status: response?.goal?.status };
+      return { action, status: goal?.status };
     }
 
     this.logger.info(`Waiting for model recovery before recovering thread ${threadId}`);
@@ -501,8 +571,19 @@ export class GoalWatchdogController {
     if (!this.#isCurrentPending(threadId, state, pending)) return null;
     response = await this.sendRequest("thread/goal/get", { threadId });
     if (!this.#isCurrentPending(threadId, state, pending)) return null;
-    action = this.#selectRecoveryAction(response?.goal, resumableStatuses);
-    return { action, status: response?.goal?.status };
+    goal = getExplicitGoal(response);
+    action = this.#selectRecoveryAction(goal, resumableStatuses);
+    return { action, status: goal?.status };
+  }
+
+  async #sendRecoveryAction(action, threadId) {
+    if (action === "resume-goal") {
+      return this.sendRequest("thread/goal/set", { threadId, status: "active" });
+    }
+    return this.sendRequest("turn/start", {
+      threadId,
+      input: [{ type: "text", text: DEFAULT_CONTINUE_PROMPT }],
+    });
   }
 
   #scheduleResume(threadId, turnId, state, requireBlocked) {
@@ -525,7 +606,7 @@ export class GoalWatchdogController {
     state.pending = pending;
     if (requireBlocked) {
       this.logger.info(
-        `Goal ${threadId} blocked by a transient error; resume in ${delayMs}ms`,
+        `Thread ${threadId}/${turnId} recovery scheduled in ${delayMs}ms`,
       );
     } else {
       this.logger.info(`Interrupted turn ${threadId}/${turnId}; resume in ${delayMs}ms`);
@@ -533,7 +614,9 @@ export class GoalWatchdogController {
   }
 
   async #resumeGoal(threadId, turnId, state, requireBlocked, pending) {
-    let resumeSent = false;
+    let actionSent = false;
+    let recoveryAction = null;
+    let turnGeneration = null;
 
     try {
       const resumableStatuses = requireBlocked
@@ -551,35 +634,54 @@ export class GoalWatchdogController {
         return;
       }
 
-      if (recovery.action !== "resume-goal") {
+      if (!recovery.action) {
         this.#releasePending(state, pending);
         this.logger.info(
-          `Goal ${threadId} is ${recovery.status ?? "unknown"}; automatic resume skipped`,
+          `Thread ${threadId} recovery skipped; status is ${recovery.status ?? "unknown"}`,
         );
         return;
       }
 
+      recoveryAction = recovery.action;
+      turnGeneration = state.turnGeneration;
       this.#releasePending(state, pending);
-      resumeSent = true;
-      await this.sendRequest("thread/goal/set", { threadId, status: "active" });
-      if (this.threads.get(threadId) !== state) return;
+      actionSent = true;
+      await this.#sendRecoveryAction(recoveryAction, threadId);
+      if (!this.#isCurrentTurnGeneration(threadId, state, turnGeneration)) return;
       state.attempt += 1;
       state.transientTurns.delete(turnId);
       state.blockedTurns.delete(turnId);
       state.interruptAttempts.delete(turnId);
-      this.logger.info(`Goal ${threadId} resumed automatically`);
+      if (recoveryAction === "resume-goal") {
+        this.logger.info(`Goal ${threadId} resumed automatically`);
+      } else {
+        this.logger.info(`Thread ${threadId} continued automatically`);
+      }
     } catch (error) {
-      if (!resumeSent) {
+      if (!actionSent) {
         if (!this.#isCurrentPending(threadId, state, pending)) return;
         this.#releasePending(state, pending);
+      } else if (!this.#isCurrentTurnGeneration(threadId, state, turnGeneration)) {
+        return;
       }
-      this.logger.error(`Failed to resume goal ${threadId}: ${error.message}`);
+      const classification = classifyRecoveryRequestError(error);
+      if (
+        actionSent &&
+        recoveryAction === "continue-turn" &&
+        classification.retry
+      ) {
+        this.logger.error(
+          `Thread ${threadId}/${turnId} recovery stopped: turn/start delivery is uncertain`,
+        );
+        this.#resetThread(threadId);
+        return;
+      }
+      this.logger.error(`Thread ${threadId} recovery failed: ${error.message}`);
       if (this.threads.get(threadId) !== state) return;
       if (state.activeTurnId && state.activeTurnId !== turnId) return;
-      const classification = classifyRecoveryRequestError(error);
       if (!classification.retry) {
         this.logger.error(
-          `Stopped goal recovery for ${threadId}/${turnId}: ${classification.reason}`,
+          `Thread ${threadId}/${turnId} recovery stopped: ${classification.reason}`,
         );
         this.#resetThread(threadId);
         return;

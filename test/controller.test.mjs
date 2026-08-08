@@ -3,6 +3,9 @@ import test from "node:test";
 
 import { GoalWatchdogController } from "../src/controller.mjs";
 
+const DEFAULT_CONTINUE_PROMPT_FOR_TEST =
+  "继续完成刚才因上游服务故障而中断的任务。先检查当前状态，不要重复已完成的步骤。";
+
 function deferred() {
   let resolve;
   let reject;
@@ -17,6 +20,8 @@ function createHarness({
   goalStatus = "blocked",
   goalGetResponses = [],
   goalSetResponses = [],
+  turnStartResponses = [],
+  turnInterruptResponses = [],
   compactResponses = [],
   interruptAfterMs = 120_000,
   recoveryGate = null,
@@ -25,7 +30,9 @@ function createHarness({
   const timers = [];
   const cancelled = [];
   const logs = [];
-  const goals = new Map([["thread-1", { status: goalStatus }]]);
+  const goals = goalStatus === null
+    ? new Map()
+    : new Map([["thread-1", { status: goalStatus }]]);
 
   const controller = new GoalWatchdogController({
     delaysMs: [30_000, 60_000, 120_000],
@@ -51,7 +58,27 @@ function createHarness({
         return { goal: goals.get(params.threadId) };
       }
       if (method === "turn/interrupt") {
+        if (turnInterruptResponses.length > 0) {
+          const response = turnInterruptResponses.shift();
+          if (response instanceof Error) throw response;
+          return response;
+        }
         return { turnId: params.turnId, status: "interrupting" };
+      }
+      if (method === "turn/start") {
+        if (turnStartResponses.length > 0) {
+          const response = turnStartResponses.shift();
+          if (response instanceof Error) throw response;
+          return response;
+        }
+        return {
+          turn: {
+            id: "turn-recovery",
+            status: "inProgress",
+            items: [],
+            error: null,
+          },
+        };
       }
       if (method === "thread/compact/start") {
         if (compactResponses.length === 0) return {};
@@ -100,6 +127,20 @@ function retrying503() {
   const notification = terminal503();
   notification.params.willRetry = true;
   return notification;
+}
+
+function failedTurn(turnId = "turn-1") {
+  return {
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: {
+        id: turnId,
+        status: "failed",
+        error: { message: "service unavailable" },
+      },
+    },
+  };
 }
 
 function blockedGoal(status = "blocked") {
@@ -190,6 +231,112 @@ test("waits for model recovery before resuming a goal", async () => {
     "thread/goal/get",
     "thread/goal/set",
   ]);
+});
+
+test("continues a failed ordinary thread after model recovery", async () => {
+  const gate = deferred();
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: () => gate.promise },
+  });
+
+  controller.handleNotification(terminal503());
+  assert.equal(timers.length, 0);
+
+  controller.handleNotification(failedTurn());
+  const recovery = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.some(({ method }) => method === "turn/start"), false);
+
+  gate.resolve();
+  await recovery;
+  assert.deepEqual(requests.at(-1), {
+    method: "turn/start",
+    params: {
+      threadId: "thread-1",
+      input: [{
+        type: "text",
+        text: DEFAULT_CONTINUE_PROMPT_FOR_TEST,
+      }],
+    },
+  });
+});
+
+test("cancels ordinary continuation when a user starts a new turn", async () => {
+  const gate = deferred();
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: () => gate.promise },
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+  const recovery = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-manual" } },
+  });
+  gate.resolve();
+  await recovery;
+
+  assert.equal(requests.some(({ method }) => method === "turn/start"), false);
+});
+
+test("does not continue an ordinary thread without a gate", () => {
+  const { controller, timers } = createHarness({ goalStatus: null });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+
+  assert.equal(timers.length, 0);
+});
+
+test("does not continue when goal lookup omits the goal field", async () => {
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    goalGetResponses: [{}],
+    recoveryGate: { waitForRecovery: async () => {} },
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+
+  await timers[0].callback();
+
+  assert.deepEqual(requests, [
+    { method: "thread/goal/get", params: { threadId: "thread-1" } },
+  ]);
+});
+
+test("uses neutral recovery logs for a failed ordinary thread", async () => {
+  const gate = deferred();
+  const { controller, timers, logs } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: () => gate.promise },
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+
+  const recovery = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  gate.resolve();
+  await recovery;
+
+  assert.equal(
+    logs.some(
+      ({ message }) =>
+        message === "Thread thread-1/turn-1 recovery scheduled in 30000ms",
+    ),
+    true,
+  );
+  assert.equal(
+    logs.some(
+      ({ message }) => message === "Thread thread-1 continued automatically",
+    ),
+    true,
+  );
+  assert.deepEqual(
+    logs.filter(({ message }) => message.startsWith("Goal ")),
+    [],
+  );
 });
 
 test("stops ordinary goal recovery after a permanent goal lookup failure", async () => {
@@ -352,6 +499,234 @@ test("interrupts a long-running retrying turn once, then resumes the goal", asyn
     },
   ]);
   assert.equal(goals.get("thread-1").status, "active");
+});
+
+test("interrupts and continues a retrying ordinary thread", async () => {
+  const gate = deferred();
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: () => gate.promise },
+    interruptAfterMs: 10,
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(retrying503());
+
+  await timers[0].callback();
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "interrupted", error: null },
+    },
+  });
+  const recovery = timers[1].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  gate.resolve();
+  await recovery;
+
+  assert.deepEqual(requests.map(({ method }) => method), [
+    "thread/goal/get",
+    "turn/interrupt",
+    "thread/goal/get",
+    "thread/goal/get",
+    "turn/start",
+  ]);
+});
+
+test("continues after a dispatched interrupt response is lost", async () => {
+  const gate = deferred();
+  const interruptResponse = deferred();
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: () => gate.promise },
+    turnInterruptResponses: [interruptResponse.promise],
+    interruptAfterMs: 10,
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(retrying503());
+
+  const interruptAttempt = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.at(-1).method, "turn/interrupt");
+
+  const error = new Error("503 Service Unavailable");
+  error.code = 503;
+  interruptResponse.reject(error);
+  await interruptAttempt;
+
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "interrupted", error: null },
+    },
+  });
+
+  assert.equal(timers.length, 2);
+  assert.equal(
+    requests.filter(({ method }) => method === "turn/interrupt").length,
+    1,
+  );
+  const recovery = timers[1].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  gate.resolve();
+  await recovery;
+
+  assert.equal(
+    requests.filter(({ method }) => method === "turn/start").length,
+    1,
+  );
+});
+
+test("does not continue after a definitive interrupt rejection", async () => {
+  const interruptResponse = deferred();
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: async () => {} },
+    turnInterruptResponses: [interruptResponse.promise],
+    interruptAfterMs: 10,
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(retrying503());
+
+  const interruptAttempt = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  const error = new Error("400 invalid request");
+  error.code = 400;
+  interruptResponse.reject(error);
+  await interruptAttempt;
+
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "interrupted", error: null },
+    },
+  });
+
+  assert.equal(timers.length, 1);
+  assert.equal(
+    requests.some(({ method }) => method === "turn/start"),
+    false,
+  );
+});
+
+test("continues a retrying ordinary thread that fails before its interrupt", async () => {
+  const gate = deferred();
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: () => gate.promise },
+    interruptAfterMs: 10,
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(retrying503());
+  const interruptTimer = timers[0];
+
+  controller.handleNotification(failedTurn("turn-1"));
+
+  assert.equal(interruptTimer.cancelled, true);
+  assert.equal(timers.length, 2);
+  assert.equal(timers[1].delayMs, 30_000);
+  await interruptTimer.callback();
+  assert.equal(
+    requests.some(({ method }) => method === "turn/interrupt"),
+    false,
+  );
+
+  const recovery = timers[1].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  gate.resolve();
+  await recovery;
+
+  assert.equal(requests.at(-1).method, "turn/start");
+});
+
+test("does not retry stale ordinary recovery after a newer turn completes", async () => {
+  const turnStart = deferred();
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: async () => {} },
+    turnStartResponses: [turnStart.promise],
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn("turn-1"));
+
+  const recovery = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.at(-1).method, "turn/start");
+
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-2" } },
+  });
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-2", status: "completed", error: null },
+    },
+  });
+  const error = new Error("503 Service Unavailable");
+  error.code = 503;
+  turnStart.reject(error);
+  await recovery;
+
+  assert.equal(
+    requests.filter(({ method }) => method === "turn/start").length,
+    1,
+  );
+  assert.equal(timers.length, 1);
+});
+
+test("does not retry an uncertain ordinary turn start", async () => {
+  const turnStart = deferred();
+  const { controller, timers, requests, logs } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: async () => {} },
+    turnStartResponses: [turnStart.promise],
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+
+  const recovery = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.at(-1).method, "turn/start");
+
+  const error = new Error("503 Service Unavailable");
+  error.code = 503;
+  turnStart.reject(error);
+  await recovery;
+
+  assert.equal(
+    requests.filter(({ method }) => method === "turn/start").length,
+    1,
+  );
+  assert.equal(timers.length, 1);
+  assert.equal(controller.threads.has("thread-1"), false);
+  assert.equal(
+    logs.some(
+      ({ message }) =>
+        message ===
+        "Thread thread-1/turn-1 recovery stopped: turn/start delivery is uncertain",
+    ),
+    true,
+  );
 });
 
 test("cancels a pending interrupt when the same turn makes progress", async () => {
@@ -672,6 +1047,26 @@ test("does not interrupt a goal that is already blocked", async () => {
   ]);
 });
 
+test("does not interrupt when goal lookup omits the goal field", async () => {
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    goalGetResponses: [{}],
+    recoveryGate: { waitForRecovery: async () => {} },
+    interruptAfterMs: 5_000,
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(retrying503());
+
+  await timers[0].callback();
+
+  assert.deepEqual(requests, [
+    { method: "thread/goal/get", params: { threadId: "thread-1" } },
+  ]);
+});
+
 test("uses blocked-goal recovery when the blocked event arrives first", async () => {
   const { controller, timers, requests } = createHarness({
     goalStatus: "blocked",
@@ -780,6 +1175,78 @@ test("compacts the original thread and resumes its blocked goal after context ex
     { method: "thread/goal/get", params: { threadId: "thread-1" } },
     { method: "thread/goal/set", params: { threadId: "thread-1", status: "active" } },
   ]);
+});
+
+test("continues an ordinary thread after context compaction", async () => {
+  const gate = deferred();
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: () => gate.promise },
+  });
+  controller.handleNotification(contextWindowExceeded());
+  await timers[0].callback();
+  controller.handleNotification({
+    method: "thread/compacted",
+    params: { threadId: "thread-1", turnId: "turn-context" },
+  });
+  const recovery = timers.at(-1).callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  gate.resolve();
+  await recovery;
+
+  assert.equal(requests.at(-1).method, "turn/start");
+  assert.equal(requests.at(-1).params.threadId, "thread-1");
+  assert.equal(
+    requests.at(-1).params.input[0].text,
+    DEFAULT_CONTINUE_PROMPT_FOR_TEST,
+  );
+});
+
+test("does not retry an uncertain ordinary turn start after compaction", async () => {
+  const gate = deferred();
+  const turnStart = deferred();
+  const { controller, timers, requests, logs } = createHarness({
+    goalStatus: null,
+    recoveryGate: { waitForRecovery: () => gate.promise },
+    turnStartResponses: [turnStart.promise],
+  });
+  controller.handleNotification(contextWindowExceeded());
+  await timers[0].callback();
+  controller.handleNotification({
+    method: "thread/compacted",
+    params: { threadId: "thread-1", turnId: "turn-context" },
+  });
+
+  const recovery = timers.at(-1).callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    requests.some(({ method }) => method === "turn/start"),
+    false,
+  );
+  gate.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.at(-1).method, "turn/start");
+  const timerCountBeforeRejection = timers.length;
+
+  const error = new Error("503 Service Unavailable");
+  error.code = 503;
+  turnStart.reject(error);
+  await recovery;
+
+  assert.equal(
+    requests.filter(({ method }) => method === "turn/start").length,
+    1,
+  );
+  assert.equal(timers.length, timerCountBeforeRejection);
+  assert.equal(controller.threads.has("thread-1"), false);
+  assert.equal(
+    logs.some(
+      ({ message }) =>
+        message ===
+        "Thread thread-1/turn-context recovery after compaction stopped: turn/start delivery is uncertain",
+    ),
+    true,
+  );
 });
 
 test("does not cancel context recovery when the compaction turn completes before resume runs", async () => {
@@ -1085,7 +1552,9 @@ test("does not retry stale compact recovery after a new turn starts during goal 
 
   assert.equal(timers.length, 3);
   assert.equal(
-    logs.some(({ message }) => message.includes("Failed to resume compacted goal")),
+    logs.some(({ message }) =>
+      message.includes("Thread thread-1 recovery after compaction failed")
+    ),
     false,
   );
 
