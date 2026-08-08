@@ -93,6 +93,25 @@ export function ensureWorkingDirectoryArg(args, cwd) {
   return hasExplicitCwd ? args : ["-C", cwd, ...args];
 }
 
+export function parseBooleanFlag(value, variableName) {
+  if (value == null || value === "") return false;
+  if (typeof value === "string") {
+    const normalized = value.toLowerCase();
+    if (normalized === "1" || normalized === "true") return true;
+    if (normalized === "0" || normalized === "false") return false;
+  }
+  throw new Error(`${variableName} must be 1, true, 0, or false`);
+}
+
+export function parsePositiveMilliseconds(value, defaultValue, variableName) {
+  if (value == null || value === "") return defaultValue;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${variableName} must be a positive number of milliseconds`);
+  }
+  return parsed;
+}
+
 export function parseNonNegativeMilliseconds(value, defaultValue, variableName) {
   if (!value) return defaultValue;
   const parsed = Number(value);

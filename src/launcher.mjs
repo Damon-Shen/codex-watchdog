@@ -8,16 +8,22 @@ import {
   allocateDistinctTcpPorts,
   allocateTcpPort,
   ensureWorkingDirectoryArg,
+  parseBooleanFlag,
   parseNonNegativeMilliseconds,
+  parsePositiveMilliseconds,
   resolveCodexEntrypoint,
   validateForwardedArgs,
   waitForHttpReady,
 } from "./launcher-support.mjs";
+import { ModelRecoveryProbe } from "./model-probe.mjs";
 import { createWatchdogProxy } from "./proxy.mjs";
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEFAULT_DELAYS_MS = [30_000, 60_000, 120_000, 300_000];
 const DEFAULT_INTERRUPT_AFTER_MS = 120_000;
+const DEFAULT_PROBE_URL = "https://status.input.im/api/status";
+const DEFAULT_TARGET_MODEL = "gpt-5.6-sol";
+const DEFAULT_PROBE_INTERVAL_MS = 30_000;
 
 function parseDelays(value) {
   if (!value) return DEFAULT_DELAYS_MS;
@@ -71,6 +77,8 @@ async function main() {
   let appServer;
   let tui;
   let proxy;
+  let probe = null;
+  let tuiTerminationSignal = "SIGTERM";
   let requestedSignal = null;
   let resolveSignal;
   const signalPromise = new Promise((resolve) => { resolveSignal = resolve; });
@@ -95,6 +103,23 @@ async function main() {
       DEFAULT_INTERRUPT_AFTER_MS,
       "CODEX_WATCHDOG_INTERRUPT_AFTER_MS",
     );
+    const probeEnabled = parseBooleanFlag(
+      process.env.CODEX_WATCHDOG_PROBE_ENABLED,
+      "CODEX_WATCHDOG_PROBE_ENABLED",
+    );
+    if (probeEnabled) {
+      probe = new ModelRecoveryProbe({
+        url: process.env.CODEX_WATCHDOG_PROBE_URL || DEFAULT_PROBE_URL,
+        targetModel: process.env.CODEX_WATCHDOG_TARGET_MODEL || DEFAULT_TARGET_MODEL,
+        intervalMs: parsePositiveMilliseconds(
+          process.env.CODEX_WATCHDOG_PROBE_INTERVAL_MS,
+          DEFAULT_PROBE_INTERVAL_MS,
+          "CODEX_WATCHDOG_PROBE_INTERVAL_MS",
+        ),
+        logger,
+      });
+      probe.start();
+    }
     const forwardedArgs = process.argv.slice(2);
     validateForwardedArgs(forwardedArgs);
     const launchCwd = process.cwd();
@@ -125,6 +150,7 @@ async function main() {
       upstreamUrl: appServerUrl,
       delaysMs,
       interruptAfterMs,
+      recoveryGate: probe,
       logger,
     });
 
@@ -145,10 +171,9 @@ async function main() {
 
     if (outcome.type === "app-server") {
       logger.error(`App-server exited unexpectedly with code ${outcome.code}`);
-      await terminateChild(tui);
       process.exitCode = outcome.code ?? 1;
     } else if (outcome.type === "signal") {
-      await terminateChild(tui, outcome.signal);
+      tuiTerminationSignal = outcome.signal;
       process.exitCode = outcome.signal === "SIGINT" ? 130 : 143;
     } else {
       process.exitCode = outcome.code ?? (outcome.signal ? 1 : 0);
@@ -156,7 +181,8 @@ async function main() {
   } finally {
     for (const [signal, handler] of signalHandlers) process.off(signal, handler);
     if (proxy) await proxy.close();
-    await terminateChild(tui);
+    probe?.close();
+    await terminateChild(tui, tuiTerminationSignal);
     await terminateChild(appServer);
     closeSync(logger.fd);
   }

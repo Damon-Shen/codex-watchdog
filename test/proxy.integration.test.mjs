@@ -39,7 +39,27 @@ function waitForMessage(socket, predicate, timeoutMs = 2_000) {
   });
 }
 
-async function startMockAppServer() {
+async function waitForCondition(predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = predicate();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("timed out waiting for condition");
+}
+
+function createDeferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+async function startMockAppServer({
+  goal = { threadId: "thread-1", status: "blocked" },
+} = {}) {
   const httpServer = createServer();
   const wss = new WebSocketServer({ server: httpServer });
   const received = [];
@@ -56,7 +76,7 @@ async function startMockAppServer() {
         socket.send(
           JSON.stringify({
             id: message.id,
-            result: { goal: { threadId: "thread-1", status: "blocked" } },
+            result: { goal },
           }),
         );
       } else if (message.method === "thread/goal/set") {
@@ -82,6 +102,11 @@ async function startMockAppServer() {
           method: "thread/compacted",
           params: { threadId: "thread-1", turnId: "turn-compact" },
         })));
+      } else if (message.method === "turn/start") {
+        socket.send(JSON.stringify({
+          id: message.id,
+          result: { turn: { id: "turn-recovery", status: "inProgress" } },
+        }));
       }
     });
   });
@@ -266,6 +291,117 @@ test("transparently forwards TUI traffic and injects an isolated goal resume", a
     "active",
   );
   assert.ok(logs.some((message) => message.includes("resumed automatically")));
+});
+
+test("continues an ordinary thread after the recovery gate resolves", async (t) => {
+  const upstream = await startMockAppServer({ goal: null });
+  const recovery = createDeferred();
+  const logs = [];
+  let beginCalls = 0;
+  let waitCalls = 0;
+  let closeCalls = 0;
+  const recoveryGate = {
+    beginRecoveryCheck() {
+      assert.equal(this, recoveryGate);
+      beginCalls += 1;
+    },
+    waitForRecovery() {
+      assert.equal(this, recoveryGate);
+      waitCalls += 1;
+      return recovery.promise;
+    },
+    close() {
+      closeCalls += 1;
+    },
+  };
+  const proxy = await createWatchdogProxy({
+    listenHost: "127.0.0.1",
+    listenPort: 0,
+    upstreamUrl: upstream.url,
+    delaysMs: [0],
+    recoveryGate,
+    logger: {
+      info: (message) => logs.push(message),
+      warn: (message) => logs.push(message),
+      error: (message) => logs.push(message),
+    },
+  });
+  const tui = new WebSocket(proxy.url);
+
+  t.after(async () => {
+    tui.close();
+    await proxy.close();
+    assert.equal(closeCalls, 0);
+    await upstream.close();
+  });
+
+  await waitForOpen(tui);
+  const initializeResponse = waitForMessage(tui, (message) => message.id === "ordinary-init");
+  tui.send(JSON.stringify({
+    method: "initialize",
+    id: "ordinary-init",
+    params: { clientInfo: { name: "test", title: "Test", version: "1" } },
+  }));
+  await initializeResponse;
+
+  const forwardedError = waitForMessage(tui, (message) => message.method === "error");
+  upstream.send({
+    method: "error",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      willRetry: false,
+      error: {
+        message: "upstream 503",
+        codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 503 } },
+        additionalDetails: null,
+      },
+    },
+  });
+
+  await forwardedError;
+  assert.equal(beginCalls, 1);
+  assert.equal(waitCalls, 0);
+  assert.equal(
+    upstream.received.filter(({ method }) => method === "turn/start").length,
+    0,
+  );
+
+  const forwardedCompletion = waitForMessage(
+    tui,
+    (message) => message.method === "turn/completed" && message.params.turn.id === "turn-1",
+  );
+  upstream.send({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        status: "failed",
+        error: { message: "upstream 503" },
+      },
+    },
+  });
+
+  await forwardedCompletion;
+  await waitForCondition(() => waitCalls === 1);
+  assert.equal(
+    upstream.received.filter(({ method }) => method === "turn/start").length,
+    0,
+  );
+
+  recovery.resolve("confirmed-healthy");
+  await waitForCondition(() => logs.some((message) => message.includes("continued automatically")));
+
+  const turnStarts = upstream.received.filter(({ method }) => method === "turn/start");
+  assert.equal(turnStarts.length, 1);
+  assert.deepEqual(turnStarts[0].params, {
+    threadId: "thread-1",
+    input: [{
+      type: "text",
+      text: "继续完成刚才因上游服务故障而中断的任务。先检查当前状态，不要重复已完成的步骤。",
+    }],
+  });
 });
 
 test("forwards a retrying-turn interrupt and resumes the goal through app-server", async (t) => {

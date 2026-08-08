@@ -6,7 +6,9 @@ import {
   allocateDistinctTcpPorts,
   allocateTcpPort,
   ensureWorkingDirectoryArg,
+  parseBooleanFlag,
   parseNonNegativeMilliseconds,
+  parsePositiveMilliseconds,
   resolveCodexEntrypoint,
   validateForwardedArgs,
   waitForHttpReady,
@@ -146,4 +148,55 @@ test("parses an optional non-negative millisecond setting", () => {
     () => parseNonNegativeMilliseconds("-1", 120_000, "SETTING"),
     /SETTING must be a non-negative number/,
   );
+});
+
+test("defaults a missing boolean flag to false", () => {
+  for (const value of [undefined, null, ""]) {
+    assert.equal(parseBooleanFlag(value, "PROBE_ENABLED"), false);
+  }
+});
+
+test("parses enabled boolean flag values case-insensitively", () => {
+  for (const value of ["1", "true", "TRUE", "TrUe"]) {
+    assert.equal(parseBooleanFlag(value, "PROBE_ENABLED"), true);
+  }
+});
+
+test("parses disabled boolean flag values case-insensitively", () => {
+  for (const value of ["0", "false", "FALSE", "FaLsE"]) {
+    assert.equal(parseBooleanFlag(value, "PROBE_ENABLED"), false);
+  }
+});
+
+test("rejects unsupported boolean flag values with the allowed values", () => {
+  for (const value of ["yes", "2", " true ", true]) {
+    assert.throws(
+      () => parseBooleanFlag(value, "PROBE_ENABLED"),
+      (error) => {
+        assert.match(error.message, /PROBE_ENABLED/);
+        assert.match(error.message, /1.*true.*0.*false/);
+        return true;
+      },
+    );
+  }
+});
+
+test("defaults a missing positive millisecond setting", () => {
+  for (const value of [undefined, null, ""]) {
+    assert.equal(parsePositiveMilliseconds(value, 30_000, "PROBE_INTERVAL"), 30_000);
+  }
+});
+
+test("parses finite positive millisecond settings", () => {
+  assert.equal(parsePositiveMilliseconds("2500", 30_000, "PROBE_INTERVAL"), 2_500);
+  assert.equal(parsePositiveMilliseconds(0.5, 30_000, "PROBE_INTERVAL"), 0.5);
+});
+
+test("rejects non-positive and non-finite millisecond settings", () => {
+  for (const value of ["0", 0, "-1", "NaN", Number.NaN, "Infinity", Infinity]) {
+    assert.throws(
+      () => parsePositiveMilliseconds(value, 30_000, "PROBE_INTERVAL"),
+      /PROBE_INTERVAL/,
+    );
+  }
 });
