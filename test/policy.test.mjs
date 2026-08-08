@@ -36,6 +36,21 @@ test("classifies structured provider 503 as transient", () => {
   });
 });
 
+test("classifies model-at-capacity errors as transient", () => {
+  const result = classifyTerminalError(
+    errorNotification({
+      info: "other",
+      message: "Selected model is at capacity. Please try a different model.",
+    }),
+  );
+
+  assert.deepEqual(result, {
+    transient: true,
+    reason: "model-at-capacity",
+    statusCode: null,
+  });
+});
+
 test("classifies provider 429 after retry exhaustion as transient", () => {
   const notifications = [
     errorNotification({

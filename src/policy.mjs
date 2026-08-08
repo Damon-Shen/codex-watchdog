@@ -10,6 +10,8 @@ const PERMANENT_MESSAGE_PATTERN =
   /\b(?:compact(?:ion)?|context window|usage limit|quota|credit.?exhaust|insufficient[_ -]?quota|unauthori[sz]ed|forbidden|bad request|invalid request|authentication)\b/i;
 const TRANSIENT_MESSAGE_PATTERN =
   /\b(?:service unavailable|bad gateway|gateway timeout|connection (?:reset|refused)|network (?:error|failure)|timed? out|stream (?:closed|disconnected))\b/i;
+const MODEL_AT_CAPACITY_PATTERN =
+  /^selected model is at capacity\. please try a different model\.$/i;
 
 function result(transient, reason, statusCode = null, willRetry = false) {
   const classification = { transient, reason, statusCode };
@@ -73,6 +75,9 @@ export function classifyTerminalError(notification) {
 
   if (info === "serverOverloaded") {
     return result(true, "server-overloaded", null, willRetry);
+  }
+  if (MODEL_AT_CAPACITY_PATTERN.test(message)) {
+    return result(true, "model-at-capacity", null, willRetry);
   }
 
   const httpMatch = message.match(/(?:^|\D)(429|502|503|504)(?:\D|$)/);
