@@ -15,6 +15,8 @@ Codex Goal Watchdog 是一个本地启动器，用来降低 Codex `/goal` 因短
 - 重试长时间没有恢复时，中断该 turn 一次，并在确认 goal 状态后继续运行。
 - 终态瞬时错误已经把 goal 置为 `blocked` 时，按退避时间重新激活同一个 goal。
 - 上下文窗口耗尽时，先压缩原 thread，再恢复同一个 goal。
+- 可选地在可恢复错误后探测中转站目标模型；确认模型恢复后，自动恢复 goal，或在普通
+  thread 中发送新的继续 turn。
 
 它不会绕过人工暂停、认证失败、用量限制、token budget、额度不足或已经完成的 goal。
 
@@ -87,6 +89,10 @@ codex-watchdog resume --all
 | `CODEX_WATCHDOG_CODEX_JS` | 指定 Codex 的 `codex.js` 入口 | 自动查找全局 npm 安装 |
 | `CODEX_WATCHDOG_DELAYS_MS` | 逗号分隔的恢复退避时间，单位毫秒 | `30000,60000,120000,300000` |
 | `CODEX_WATCHDOG_INTERRUPT_AFTER_MS` | Codex 持续重试多久后允许中断当前 turn | `120000` |
+| `CODEX_WATCHDOG_PROBE_ENABLED` | 启用错误触发的中转站确认探针（`1`/`true`） | 未启用 |
+| `CODEX_WATCHDOG_PROBE_URL` | 中转站状态接口 | `https://status.input.im/api/status` |
+| `CODEX_WATCHDOG_TARGET_MODEL` | `services[].model` 的精确匹配值 | `gpt-5.6-sol` |
+| `CODEX_WATCHDOG_PROBE_INTERVAL_MS` | 两次确认探测的间隔，单位毫秒 | `30000` |
 
 临时缩短退避时间进行测试：
 
@@ -108,6 +114,26 @@ Codex TUI -> watchdog WebSocket proxy -> Codex app-server -> provider
 - `turn/interrupt`：仍在重试且超过宽限期时，对同一 turn 最多发送一次。
 - `thread/compact/start`：上下文耗尽时压缩原 thread。
 - `thread/goal/set`：turn 结束或压缩完成后，把可恢复的 goal 设回 `active`。
+- `turn/start`：探针确认普通 thread 的上游恢复后，在原 `threadId` 中开始新的继续 turn。
+
+启用 `CODEX_WATCHDOG_PROBE_ENABLED` 后，探针不会在错误发生前持续轮询。每个 turn 首次
+识别到可恢复错误时立即发起一次目标模型探测；探测结果必须满足以下任一条件才允许自动
+恢复：
+
+- `true -> true`：两次探测之间至少间隔 `CODEX_WATCHDOG_PROBE_INTERVAL_MS`，表示连续确认
+  中转站可用。
+- `false -> true`：先观察到模型不可用，之后首次有效的 `true` 表示恢复。
+
+请求失败、非 2xx、响应异常或目标模型缺失会被视为未知状态。未知状态不会放行恢复；它
+会打断连续 `true`，但不会清除已经观察到的 `false`。普通 thread 的恢复会调用同一个
+thread 的 `turn/start`，并发送“继续”消息，因此不会创建新的 Codex thread。探针关闭时，
+goal 模式保持原有恢复行为；普通模式不会启用这条自动续跑路径。
+
+同一 thread 的不同 turn 连续出现 429 时，第一次仍按正常流程处理。若第二次确认结果是
+`true -> true`，watchdog 会停止自动恢复并记录可能达到当日限额；若本轮曾观察到
+`false`，即使随后恢复为 `true`，仍会继续任务。精确错误
+`Selected model is at capacity. Please try a different model.` 也会触发上述探针恢复流程，
+但不会伪装成 429。
 
 如果同一 turn 又出现 `item/*` 进展，待执行的中断会被取消。watchdog 发起中断后，单独
 收到 `active` 状态不足以证明 Codex 已经继续；只有新的 turn 真正开始，才会取消待执行
