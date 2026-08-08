@@ -14,6 +14,7 @@ export class ModelRecoveryProbe {
   #started = false;
   #closed = false;
   #waiters = new Set();
+  #activeRequests = new Set();
 
   constructor({
     url,
@@ -44,22 +45,35 @@ export class ModelRecoveryProbe {
   }
 
   async checkNow() {
+    if (this.#closed) return null;
+
+    const controller = new AbortController();
+    this.#activeRequests.add(controller);
     try {
       const response = await this.fetchImpl(this.url, {
         method: 'GET',
-        signal: AbortSignal.timeout(this.requestTimeoutMs)
+        signal: AbortSignal.any([
+          controller.signal,
+          AbortSignal.timeout(this.requestTimeoutMs)
+        ])
       });
+      if (this.#closed) return null;
       if (!response.ok) throw new Error(`HTTP request failed: ${response.status ?? 'unknown status'}`);
 
       const payload = await response.json();
+      if (this.#closed) return null;
       const status = readModelStatus(payload, this.targetModel);
       if (typeof status !== 'boolean') throw new Error('model status is unknown');
 
       this.#recordSample(status);
       return status;
     } catch (error) {
-      this.logger?.warn?.('Model probe check failed', error);
+      if (this.#closed) return null;
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger?.warn?.(`Model probe check failed for ${this.targetModel}: ${message}`);
       return null;
+    } finally {
+      this.#activeRequests.delete(controller);
     }
   }
 
@@ -80,6 +94,8 @@ export class ModelRecoveryProbe {
   close() {
     if (this.#closed) return;
     this.#closed = true;
+    for (const controller of this.#activeRequests) controller.abort();
+    this.#activeRequests.clear();
     if (this.#timer !== null) {
       this.cancel(this.#timer);
       this.#timer = null;
@@ -99,6 +115,7 @@ export class ModelRecoveryProbe {
   }
 
   #recordSample(status) {
+    if (this.#closed) return;
     if (status === false) {
       this.#state = 'down';
       return;

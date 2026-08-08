@@ -23,6 +23,13 @@ function stateProbe() {
   };
 }
 
+function modelResponse(status) {
+  return {
+    ok: true,
+    json: async () => ({ services: [{ model: 'target', last: { ok: status } }] })
+  };
+}
+
 test('readModelStatus uses exact model matching and accepts only boolean last.ok', () => {
   const payload = {
     services: [
@@ -155,33 +162,110 @@ test('close cancels polling and rejects a pending waiter', async () => {
   probe.close();
 });
 
-test('HTTP and fetch failures return null without changing a down outage', async () => {
+const failureCases = [
+  {
+    name: 'an HTTP failure',
+    expectedMessage: 'HTTP request failed: 503',
+    response: async () => ({ ok: false, status: 503 })
+  },
+  {
+    name: 'a thrown fetch failure',
+    expectedMessage: 'offline',
+    response: async () => { throw new Error('offline'); }
+  },
+  {
+    name: 'malformed JSON',
+    expectedMessage: 'invalid JSON',
+    response: async () => ({
+      ok: true,
+      json: async () => { throw new SyntaxError('invalid JSON'); }
+    })
+  },
+  {
+    name: 'an invalid model status',
+    expectedMessage: 'model status is unknown',
+    response: async () => modelResponse('yes')
+  },
+  {
+    name: 'a missing model status',
+    expectedMessage: 'model status is unknown',
+    response: async () => ({ ok: true, json: async () => ({ services: [] }) })
+  }
+];
+
+for (const failureCase of failureCases) {
+  test(`a down outage survives ${failureCase.name}`, async () => {
+    const warnings = [];
+    let requestCount = 0;
+    const probe = new ModelRecoveryProbe({
+      url: 'http://probe',
+      targetModel: 'target',
+      fetchImpl: async () => {
+        requestCount += 1;
+        if (requestCount === 1) return modelResponse(false);
+        if (requestCount === 2) return failureCase.response();
+        return modelResponse(true);
+      },
+      logger: { warn: (...args) => warnings.push(args) }
+    });
+    const waiter = probe.waitForRecovery();
+    let settled = false;
+    waiter.then(() => { settled = true; }, () => {});
+
+    assert.equal(await probe.checkNow(), false);
+    assert.equal(await probe.checkNow(), null);
+    await Promise.resolve();
+    assert.equal(settled, false);
+    assert.equal(await probe.checkNow(), true);
+    await assert.doesNotReject(waiter);
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0].length, 1);
+    assert.match(warnings[0][0], /target/);
+    assert.match(warnings[0][0], new RegExp(failureCase.expectedMessage));
+    probe.close();
+  });
+}
+
+test('close aborts active requests without logging or accepting late results', async () => {
   const warnings = [];
-  let mode = 'http';
+  const activeSignals = [];
+  let resolveLateRequest;
+  let rejectAbortRequest;
+  let notifyRequestsStarted;
+  const requestsStarted = new Promise((resolve) => { notifyRequestsStarted = resolve; });
+  let requestCount = 0;
   const probe = new ModelRecoveryProbe({
     url: 'http://probe',
     targetModel: 'target',
-    fetchImpl: async () => {
-      if (mode === 'fetch') throw new Error('offline');
-      if (mode === 'down') return { ok: true, json: async () => ({ services: [{ model: 'target', last: { ok: false } }] }) };
-      return { ok: false, json: async () => ({}) };
+    fetchImpl: async (_url, { signal }) => {
+      requestCount += 1;
+      if (requestCount === 1) return modelResponse(false);
+      activeSignals.push(signal);
+      if (activeSignals.length === 2) notifyRequestsStarted();
+      if (requestCount === 2) {
+        return new Promise((resolve) => { resolveLateRequest = resolve; });
+      }
+      return new Promise((_resolve, reject) => {
+        rejectAbortRequest = reject;
+        signal.addEventListener('abort', () => reject(new Error('aborted by close')), { once: true });
+      });
     },
     logger: { warn: (...args) => warnings.push(args) }
   });
-
-  assert.equal(await probe.checkNow(), null);
-  mode = 'fetch';
-  assert.equal(await probe.checkNow(), null);
   const waiter = probe.waitForRecovery();
-  mode = 'down';
+  waiter.catch(() => {});
   assert.equal(await probe.checkNow(), false);
-  mode = 'fetch';
-  assert.equal(await probe.checkNow(), null);
-  let settled = false;
-  waiter.then(() => { settled = true; }, () => {});
-  await Promise.resolve();
-  assert.equal(settled, false);
-  assert.equal(warnings.length, 3);
+
+  const lateCheck = probe.checkNow();
+  const abortCheck = probe.checkNow();
+  await requestsStarted;
   probe.close();
+  const allAbortedOnClose = activeSignals.every((signal) => signal.aborted);
+  if (!allAbortedOnClose) rejectAbortRequest(new Error('request was not aborted'));
+  resolveLateRequest(modelResponse(true));
+
+  assert.equal(allAbortedOnClose, true);
+  assert.deepEqual(await Promise.all([lateCheck, abortCheck]), [null, null]);
+  assert.deepEqual(warnings, []);
   await assert.rejects(waiter, /closed/);
 });
