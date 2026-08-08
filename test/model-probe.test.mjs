@@ -262,6 +262,24 @@ test('a superseding cycle cancels the previous timer', async () => {
   probe.close();
 });
 
+test('a late canceled callback cannot release the current cycle timer', async () => {
+  const { probe, timers, cancelled } = createProbe({ replies: [false, true] });
+
+  probe.beginRecoveryCheck();
+  await flushAsyncWork();
+  const oldTimer = timers[0];
+
+  probe.beginRecoveryCheck();
+  await flushAsyncWork();
+  const currentTimer = timers[1];
+
+  oldTimer.callback();
+  await flushAsyncWork();
+  probe.close();
+
+  assert.deepEqual(cancelled, [oldTimer, currentTimer]);
+});
+
 test('a superseding cycle aborts and ignores an old active result', async () => {
   const oldResponse = deferred();
   const signals = [];

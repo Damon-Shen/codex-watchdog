@@ -130,10 +130,11 @@ export class ModelRecoveryProbe {
     if (this.#closed || cycle !== this.#cycle || this.#phase !== 'confirming') return;
     await this.checkNow(cycle);
     if (this.#closed || cycle !== this.#cycle || this.#phase !== 'confirming') return;
-    this.#timer = this.schedule(() => {
-      this.#timer = null;
+    const timer = this.schedule(() => {
+      if (this.#timer === timer) this.#timer = null;
       void this.#poll(cycle);
     }, this.intervalMs);
+    this.#timer = timer;
   }
 
   #recordSample(status, cycle) {
