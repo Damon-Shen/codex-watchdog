@@ -73,11 +73,14 @@ export function classifyTerminalError(notification) {
   const structured = structuredConnectionFailure(info);
   if (structured) return markCodexRetry(structured, willRetry);
 
+  if (MODEL_AT_CAPACITY_PATTERN.test(message)) {
+    return {
+      ...result(true, "model-at-capacity", null, willRetry),
+      recoveryMode: "immediate",
+    };
+  }
   if (info === "serverOverloaded") {
     return result(true, "server-overloaded", null, willRetry);
-  }
-  if (MODEL_AT_CAPACITY_PATTERN.test(message)) {
-    return result(true, "model-at-capacity", null, willRetry);
   }
 
   const httpMatch = message.match(/(?:^|\D)(429|502|503|504)(?:\D|$)/);

@@ -131,6 +131,22 @@ function terminal429(turnId = "turn-1") {
   return notification;
 }
 
+function modelAtCapacity(turnId = "turn-1") {
+  return {
+    method: "error",
+    params: {
+      threadId: "thread-1",
+      turnId,
+      willRetry: false,
+      error: {
+        message: "Selected model is at capacity. Please try a different model.",
+        codexErrorInfo: "serverOverloaded",
+        additionalDetails: null,
+      },
+    },
+  };
+}
+
 function retrying503() {
   const notification = terminal503();
   notification.params.willRetry = true;
@@ -742,6 +758,112 @@ test("correlates terminal error and blocked goal in either event order", () => {
     assert.equal(timers.length, 1);
     assert.equal(timers[0].delayMs, 30_000);
   }
+});
+
+test("recovers a blocked model-capacity goal immediately without probing", async () => {
+  let begins = 0;
+  let waits = 0;
+  const { controller, timers, requests } = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck() {
+        begins += 1;
+      },
+      async waitForRecovery() {
+        waits += 1;
+      },
+    },
+  });
+
+  controller.handleNotification(modelAtCapacity());
+  assert.equal(timers.length, 0);
+
+  controller.handleNotification(blockedGoal());
+  assert.deepEqual(
+    { begins, timerCount: timers.length, delayMs: timers[0]?.delayMs },
+    { begins: 0, timerCount: 1, delayMs: 0 },
+  );
+
+  await timers[0].callback();
+  assert.equal(waits, 0);
+  assert.deepEqual(requests, [
+    { method: "thread/goal/get", params: { threadId: "thread-1" } },
+    {
+      method: "thread/goal/set",
+      params: { threadId: "thread-1", status: "active" },
+    },
+  ]);
+});
+
+test("upgrades a pending blocked-goal recovery for model-capacity", async () => {
+  let waits = 0;
+  const { controller, timers, requests } = createHarness({
+    recoveryGate: {
+      async waitForRecovery() {
+        waits += 1;
+      },
+    },
+  });
+
+  controller.handleNotification(terminal503());
+  controller.handleNotification(blockedGoal());
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delayMs, 30_000);
+  const defaultTimer = timers[0];
+
+  controller.handleNotification(modelAtCapacity());
+  assert.deepEqual(
+    {
+      defaultCancelled: defaultTimer.cancelled,
+      timerCount: timers.length,
+      replacementDelayMs: timers[1]?.delayMs,
+    },
+    { defaultCancelled: true, timerCount: 2, replacementDelayMs: 0 },
+  );
+  const replacementTimer = timers[1];
+
+  controller.handleNotification(modelAtCapacity());
+  assert.equal(timers.length, 2);
+  assert.equal(replacementTimer.cancelled, false);
+
+  await defaultTimer.callback();
+  assert.equal(waits, 0);
+  assert.deepEqual(requests, []);
+
+  await replacementTimer.callback();
+  assert.equal(waits, 0);
+  assert.deepEqual(requests, [
+    { method: "thread/goal/get", params: { threadId: "thread-1" } },
+    {
+      method: "thread/goal/set",
+      params: { threadId: "thread-1", status: "active" },
+    },
+  ]);
+});
+
+test("continues an ordinary model-capacity thread immediately without a probe", async () => {
+  const { controller, timers, requests } = createHarness({ goalStatus: null });
+
+  controller.handleNotification(modelAtCapacity());
+  assert.equal(timers.length, 0);
+
+  controller.handleNotification(failedTurn());
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delayMs, 0);
+
+  await timers[0].callback();
+  assert.deepEqual(requests, [
+    { method: "thread/goal/get", params: { threadId: "thread-1" } },
+    {
+      method: "turn/start",
+      params: {
+        threadId: "thread-1",
+        input: [{
+          type: "text",
+          text: DEFAULT_CONTINUE_PROMPT_FOR_TEST,
+        }],
+      },
+    },
+  ]);
 });
 
 test("checks the current goal before resuming", async () => {

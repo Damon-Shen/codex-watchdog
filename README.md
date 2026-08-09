@@ -114,11 +114,11 @@ Codex TUI -> watchdog WebSocket proxy -> Codex app-server -> provider
 - `turn/interrupt`：仍在重试且超过宽限期时，对同一 turn 最多发送一次。
 - `thread/compact/start`：上下文耗尽时压缩原 thread。
 - `thread/goal/set`：turn 结束或压缩完成后，把可恢复的 goal 设回 `active`。
-- `turn/start`：探针确认普通 thread 的上游恢复后，在原 `threadId` 中开始新的继续 turn。
+- `turn/start`：普通 thread 满足恢复条件后，在原 `threadId` 中开始新的继续 turn。
 
 启用 `CODEX_WATCHDOG_PROBE_ENABLED` 后，探针不会在错误发生前持续轮询。每个 turn 首次
-识别到可恢复错误时立即发起一次目标模型探测；探测结果必须满足以下任一条件才允许自动
-恢复：
+识别到需要探针确认的可恢复错误时立即发起一次目标模型探测；探测结果必须满足以下任一
+条件才允许自动恢复：
 
 - `true -> true`：两次探测之间至少间隔 `CODEX_WATCHDOG_PROBE_INTERVAL_MS`，表示连续确认
   中转站可用。
@@ -127,20 +127,18 @@ Codex TUI -> watchdog WebSocket proxy -> Codex app-server -> provider
 请求失败、非 2xx、响应异常或目标模型缺失会被视为未知状态。未知状态不会放行恢复；它
 会打断连续 `true`，但不会清除已经观察到的 `false`。普通 thread 的恢复会调用同一个
 thread 的 `turn/start`，并发送“继续”消息，因此不会创建新的 Codex thread。探针关闭时，
-goal 模式保持原有恢复行为；普通模式不会启用这条自动续跑路径。
+goal 模式保持原有恢复行为；普通模式不会启用这条自动续跑路径，但下面的精确 capacity
+错误不受此限制。
 
 同一 thread 的不同 turn 连续出现 429 时，第一次仍按正常流程处理。若第二次确认结果是
 `true -> true`，watchdog 会停止自动恢复并记录可能达到当日限额；若本轮曾观察到
 `false`，即使随后恢复为 `true`，仍会继续任务。精确错误
-`Selected model is at capacity. Please try a different model.` 也会触发上述探针恢复流程，
-但不会伪装成 429。
+`Selected model is at capacity. Please try a different model.` 不会探测 aiinput，也不会使用
+恢复退避；当前 turn 确认失败或 goal 进入 `blocked` 后会立即恢复，并且不会伪装成 429。
 
 如果同一 turn 又出现 `item/*` 进展，待执行的中断会被取消。watchdog 发起中断后，单独
 收到 `active` 状态不足以证明 Codex 已经继续；只有新的 turn 真正开始，才会取消待执行
 的恢复。
-
-更完整的取舍和协议边界见
-[ADR-0001](docs/adr/0001-app-server-transient-goal-recovery.md)。
 
 ## 日志和安全边界
 
@@ -176,7 +174,6 @@ live test 会启动本机已安装的 Codex app-server，确认 WebSocket 初始
 bin/        Windows 启动脚本
 src/        启动器、代理、恢复控制器和错误分类
 test/       单元测试、代理集成测试和 live smoke test
-docs/adr/   架构决策记录
 ```
 
 ## 许可证

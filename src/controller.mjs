@@ -120,6 +120,10 @@ export class GoalWatchdogController {
     return state;
   }
 
+  #recoveryModeForTurn(state, turnId) {
+    return state.transientTurns.get(turnId)?.recoveryMode;
+  }
+
   #beginRecoveryCheckForTurn(state, turnId) {
     if (state.lastRecoveryCheckTurnId === turnId) return;
     state.lastRecoveryCheckTurnId = turnId;
@@ -226,9 +230,19 @@ export class GoalWatchdogController {
       this.logger.info(`Ignored stale transient error for ${threadId}/${turnId}`);
       return;
     }
-    this.#beginRecoveryCheckForTurn(state, turnId);
+    if (classification.recoveryMode !== "immediate") {
+      this.#beginRecoveryCheckForTurn(state, turnId);
+    }
     this.#recordFailureKind(state, turnId, classification);
     state.transientTurns.set(turnId, classification);
+    if (
+      this.#recoveryModeForTurn(state, turnId) === "immediate" &&
+      state.pending?.kind === "resume" &&
+      state.pending.turnId === turnId &&
+      state.pending.recoveryMode !== "immediate"
+    ) {
+      this.#cancelPending(state, "resume");
+    }
     this.logger.info(
       `Transient error for ${threadId}/${turnId}: ${classification.reason}`,
     );
@@ -308,8 +322,9 @@ export class GoalWatchdogController {
     const terminalFailure =
       turn?.status === "failed" ||
       (turn?.status === "completed" && Boolean(turn.error));
+    const recoveryMode = this.#recoveryModeForTurn(state, turnId);
     if (
-      this.recoveryGate &&
+      (this.recoveryGate || recoveryMode === "immediate") &&
       state.transientTurns.has(turnId) &&
       terminalFailure
     ) {
@@ -610,19 +625,24 @@ export class GoalWatchdogController {
     this.#scheduleResume(threadId, turnId, state, true);
   }
 
-  #selectRecoveryAction(goal, resumableStatuses) {
-    if (goal === null) return this.recoveryGate ? "continue-turn" : null;
+  #selectRecoveryAction(goal, resumableStatuses, recoveryMode) {
+    if (goal === null) {
+      return this.recoveryGate || recoveryMode === "immediate"
+        ? "continue-turn"
+        : null;
+    }
     if (goal === undefined) return null;
     return resumableStatuses.has(goal.status) ? "resume-goal" : null;
   }
 
   async #resolveRecoveryAction(threadId, state, pending, resumableStatuses) {
     let gateOutcome = null;
+    const recoveryMode = pending.recoveryMode;
     let response = await this.sendRequest("thread/goal/get", { threadId });
     if (!this.#isCurrentPending(threadId, state, pending)) return null;
     let goal = getExplicitGoal(response);
-    let action = this.#selectRecoveryAction(goal, resumableStatuses);
-    if (!action || !this.recoveryGate) {
+    let action = this.#selectRecoveryAction(goal, resumableStatuses, recoveryMode);
+    if (recoveryMode === "immediate" || !action || !this.recoveryGate) {
       return { action, status: goal?.status, gateOutcome };
     }
 
@@ -632,7 +652,7 @@ export class GoalWatchdogController {
     response = await this.sendRequest("thread/goal/get", { threadId });
     if (!this.#isCurrentPending(threadId, state, pending)) return null;
     goal = getExplicitGoal(response);
-    action = this.#selectRecoveryAction(goal, resumableStatuses);
+    action = this.#selectRecoveryAction(goal, resumableStatuses, recoveryMode);
     return { action, status: goal?.status, gateOutcome };
   }
 
@@ -657,13 +677,15 @@ export class GoalWatchdogController {
   #scheduleResume(threadId, turnId, state, requireBlocked) {
     if (state.pending) return;
 
+    const recoveryMode = this.#recoveryModeForTurn(state, turnId);
     const delayIndex = Math.min(state.attempt, this.delaysMs.length - 1);
-    const delayMs = this.delaysMs[delayIndex];
+    const delayMs = recoveryMode === "immediate" ? 0 : this.delaysMs[delayIndex];
     const pending = {
       kind: "resume",
       threadId,
       handle: null,
       cancelled: false,
+      recoveryMode,
       requireBlocked,
       turnId,
     };

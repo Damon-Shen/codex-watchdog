@@ -36,7 +36,40 @@ test("classifies structured provider 503 as transient", () => {
   });
 });
 
-test("classifies model-at-capacity errors as transient", () => {
+test("preserves structured HTTP 503 classification for model-at-capacity messages", () => {
+  const result = classifyTerminalError(
+    errorNotification({
+      info: { httpConnectionFailed: { httpStatusCode: 503 } },
+      message: "Selected model is at capacity. Please try a different model.",
+    }),
+  );
+
+  assert.deepEqual(result, {
+    transient: true,
+    reason: "http-503",
+    statusCode: 503,
+  });
+});
+
+test("classifies structured model-at-capacity errors for immediate recovery", () => {
+  const result = classifyTerminalError(
+    errorNotification({
+      info: "serverOverloaded",
+      message: "Selected model is at capacity. Please try a different model.",
+      willRetry: true,
+    }),
+  );
+
+  assert.deepEqual(result, {
+    transient: true,
+    reason: "model-at-capacity",
+    statusCode: null,
+    willRetry: true,
+    recoveryMode: "immediate",
+  });
+});
+
+test("classifies unstructured model-at-capacity errors for immediate recovery", () => {
   const result = classifyTerminalError(
     errorNotification({
       info: "other",
@@ -47,6 +80,22 @@ test("classifies model-at-capacity errors as transient", () => {
   assert.deepEqual(result, {
     transient: true,
     reason: "model-at-capacity",
+    statusCode: null,
+    recoveryMode: "immediate",
+  });
+});
+
+test("classifies non-capacity server overloads without immediate recovery", () => {
+  const result = classifyTerminalError(
+    errorNotification({
+      info: "serverOverloaded",
+      message: "provider overloaded",
+    }),
+  );
+
+  assert.deepEqual(result, {
+    transient: true,
+    reason: "server-overloaded",
     statusCode: null,
   });
 });
