@@ -15,6 +15,10 @@ const RESUMABLE_GOAL_STATUSES = new Set(["active", "blocked"]);
 const DEFAULT_CONTINUE_PROMPT =
   "继续完成刚才因上游服务故障而中断的任务。先检查当前状态，不要重复已完成的步骤。";
 
+function parentContinuePrompt(threadId) {
+  return `子代理线程 ${threadId} 因上游服务故障中断。请检查该子任务状态，必要时重新派发，并继续完成原任务；不要重复已完成步骤。`;
+}
+
 function getExplicitGoal(response) {
   if (
     response === null ||
@@ -73,9 +77,14 @@ export class GoalWatchdogController {
     this.logger = logger;
     this.recoveryGate = recoveryGate;
     this.threads = new Map();
+    this.threadMetadata = new Map();
   }
 
   handleNotification(message) {
+    if (message?.method === "thread/started") {
+      this.#handleThreadStarted(message.params ?? {});
+      return;
+    }
     if (message?.method === "error") {
       this.#handleError(message);
       return;
@@ -109,6 +118,7 @@ export class GoalWatchdogController {
 
   close() {
     for (const [threadId] of this.threads) this.#resetThread(threadId);
+    this.threadMetadata.clear();
   }
 
   #state(threadId) {
@@ -128,6 +138,17 @@ export class GoalWatchdogController {
     if (state.lastRecoveryCheckTurnId === turnId) return;
     state.lastRecoveryCheckTurnId = turnId;
     this.recoveryGate?.beginRecoveryCheck?.();
+  }
+
+  #handleThreadStarted(params) {
+    const thread = params.thread;
+    if (!thread?.id) return;
+    this.threadMetadata.set(thread.id, {
+      parentThreadId: typeof thread.parentThreadId === "string"
+        ? thread.parentThreadId
+        : null,
+      canAcceptDirectInput: thread.canAcceptDirectInput,
+    });
   }
 
   #handleTurnStarted(params) {
@@ -664,22 +685,64 @@ export class GoalWatchdogController {
     );
   }
 
+  #directInputThreadId(threadId) {
+    const visited = new Set();
+    let currentThreadId = threadId;
+
+    while (this.threadMetadata.get(currentThreadId)?.canAcceptDirectInput === false) {
+      if (visited.has(currentThreadId)) {
+        throw new Error(`Detected a parent cycle while recovering sub-agent ${threadId}`);
+      }
+      visited.add(currentThreadId);
+      const parentThreadId = this.threadMetadata.get(currentThreadId)?.parentThreadId;
+      if (!parentThreadId) {
+        throw new Error(`No direct-input parent is known for sub-agent ${threadId}`);
+      }
+      currentThreadId = parentThreadId;
+    }
+
+    return currentThreadId;
+  }
+
   async #sendRecoveryAction(action, threadId) {
     if (action === "resume-goal") {
       return this.sendRequest("thread/goal/set", { threadId, status: "active" });
     }
+
+    const directInputThreadId = this.#directInputThreadId(threadId);
+    const delegated = directInputThreadId !== threadId;
+    const input = [{
+      type: "text",
+      text: delegated ? parentContinuePrompt(threadId) : DEFAULT_CONTINUE_PROMPT,
+    }];
+    if (delegated) {
+      this.logger.info(
+        `Routing sub-agent recovery from ${threadId} to parent ${directInputThreadId}`,
+      );
+      const activeTurnId = this.threads.get(directInputThreadId)?.activeTurnId;
+      if (activeTurnId) {
+        return this.sendRequest("turn/steer", {
+          threadId: directInputThreadId,
+          expectedTurnId: activeTurnId,
+          input,
+        });
+      }
+    }
     return this.sendRequest("turn/start", {
-      threadId,
-      input: [{ type: "text", text: DEFAULT_CONTINUE_PROMPT }],
+      threadId: directInputThreadId,
+      input,
     });
   }
 
-  #scheduleResume(threadId, turnId, state, requireBlocked) {
+  #scheduleResume(threadId, turnId, state, requireBlocked, recoveryRequestRetry = false) {
     if (state.pending) return;
 
     const recoveryMode = this.#recoveryModeForTurn(state, turnId);
     const delayIndex = Math.min(state.attempt, this.delaysMs.length - 1);
-    const delayMs = recoveryMode === "immediate" ? 0 : this.delaysMs[delayIndex];
+    const gateOwnsDelay = Boolean(this.recoveryGate) && !recoveryRequestRetry;
+    const delayMs = recoveryMode === "immediate" || gateOwnsDelay
+      ? 0
+      : this.delaysMs[delayIndex];
     const pending = {
       kind: "resume",
       threadId,
@@ -747,7 +810,7 @@ export class GoalWatchdogController {
       actionSent = true;
       await this.#sendRecoveryAction(recoveryAction, threadId);
       if (!this.#isCurrentTurnGeneration(threadId, state, turnGeneration)) return;
-      state.attempt += 1;
+      if (pending.recoveryMode !== "immediate") state.attempt += 1;
       state.transientTurns.delete(turnId);
       state.blockedTurns.delete(turnId);
       state.interruptAttempts.delete(turnId);
@@ -787,7 +850,7 @@ export class GoalWatchdogController {
       }
       state.attempt += 1;
       state.blockedTurns.add(turnId);
-      this.#scheduleResume(threadId, turnId, state, requireBlocked);
+      this.#scheduleResume(threadId, turnId, state, requireBlocked, true);
     }
   }
 

@@ -107,6 +107,11 @@ async function startMockAppServer({
           id: message.id,
           result: { turn: { id: "turn-recovery", status: "inProgress" } },
         }));
+      } else if (message.method === "turn/steer") {
+        socket.send(JSON.stringify({
+          id: message.id,
+          result: { turnId: message.params.expectedTurnId },
+        }));
       }
     });
   });
@@ -402,6 +407,107 @@ test("continues an ordinary thread after the recovery gate resolves", async (t) 
       text: "继续完成刚才因上游服务故障而中断的任务。先检查当前状态，不要重复已完成的步骤。",
     }],
   });
+});
+
+test("routes sub-agent recovery through its active parent over the proxy", async (t) => {
+  const upstream = await startMockAppServer({ goal: null });
+  const logs = [];
+  const proxy = await createWatchdogProxy({
+    listenHost: "127.0.0.1",
+    listenPort: 0,
+    upstreamUrl: upstream.url,
+    delaysMs: [0],
+    logger: {
+      info: (message) => logs.push(message),
+      warn: (message) => logs.push(message),
+      error: (message) => logs.push(message),
+    },
+  });
+  const tui = new WebSocket(proxy.url);
+  t.after(async () => {
+    tui.terminate();
+    await proxy.close();
+    await upstream.close();
+  });
+  await waitForOpen(tui);
+  const initialized = waitForMessage(tui, (message) => message.id === "sub-agent-init");
+  tui.send(JSON.stringify({
+    method: "initialize",
+    id: "sub-agent-init",
+    params: { clientInfo: { name: "test", title: "Test", version: "1" } },
+  }));
+  await initialized;
+
+  upstream.send({
+    method: "thread/started",
+    params: {
+      thread: {
+        id: "thread-parent",
+        parentThreadId: null,
+        canAcceptDirectInput: true,
+      },
+    },
+  });
+  upstream.send({
+    method: "thread/started",
+    params: {
+      thread: {
+        id: "thread-1",
+        parentThreadId: "thread-parent",
+        canAcceptDirectInput: false,
+      },
+    },
+  });
+  upstream.send({
+    method: "turn/started",
+    params: { threadId: "thread-parent", turn: { id: "turn-parent" } },
+  });
+  upstream.send({
+    method: "error",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-child",
+      willRetry: false,
+      error: {
+        message: "Selected model is at capacity. Please try a different model.",
+        codexErrorInfo: "serverOverloaded",
+        additionalDetails: null,
+      },
+    },
+  });
+  upstream.send({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-child",
+        status: "failed",
+        error: { message: "model at capacity" },
+      },
+    },
+  });
+
+  const steer = await waitForCondition(() => (
+    upstream.received.find(({ method }) => method === "turn/steer")
+  ));
+  assert.deepEqual(steer.params, {
+    threadId: "thread-parent",
+    expectedTurnId: "turn-parent",
+    input: [{
+      type: "text",
+      text: "子代理线程 thread-1 因上游服务故障中断。请检查该子任务状态，必要时重新派发，并继续完成原任务；不要重复已完成步骤。",
+    }],
+  });
+  assert.equal(
+    upstream.received.some(
+      ({ method, params }) => method === "turn/start" && params.threadId === "thread-1",
+    ),
+    false,
+  );
+  assert.equal(
+    logs.some((message) => message.includes("Routing sub-agent recovery")),
+    true,
+  );
 });
 
 test("forwards a retrying-turn interrupt and resumes the goal through app-server", async (t) => {

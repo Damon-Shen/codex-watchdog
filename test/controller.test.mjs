@@ -6,6 +6,10 @@ import { GoalWatchdogController } from "../src/controller.mjs";
 const DEFAULT_CONTINUE_PROMPT_FOR_TEST =
   "继续完成刚才因上游服务故障而中断的任务。先检查当前状态，不要重复已完成的步骤。";
 
+function parentContinuePromptForTest(threadId) {
+  return `子代理线程 ${threadId} 因上游服务故障中断。请检查该子任务状态，必要时重新派发，并继续完成原任务；不要重复已完成步骤。`;
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -21,6 +25,7 @@ function createHarness({
   goalGetResponses = [],
   goalSetResponses = [],
   turnStartResponses = [],
+  turnSteerResponses = [],
   turnInterruptResponses = [],
   compactResponses = [],
   interruptAfterMs = 120_000,
@@ -79,6 +84,14 @@ function createHarness({
             error: null,
           },
         };
+      }
+      if (method === "turn/steer") {
+        if (turnSteerResponses.length > 0) {
+          const response = turnSteerResponses.shift();
+          if (response instanceof Error) throw response;
+          return response;
+        }
+        return { turnId: params.expectedTurnId };
       }
       if (method === "thread/compact/start") {
         if (compactResponses.length === 0) return {};
@@ -163,6 +176,18 @@ function failedTurn(turnId = "turn-1") {
         status: "failed",
         error: { message: "service unavailable" },
       },
+    },
+  };
+}
+
+function threadStarted(
+  id,
+  { parentThreadId = null, canAcceptDirectInput = true } = {},
+) {
+  return {
+    method: "thread/started",
+    params: {
+      thread: { id, parentThreadId, canAcceptDirectInput },
     },
   };
 }
@@ -807,7 +832,7 @@ test("upgrades a pending blocked-goal recovery for model-capacity", async () => 
   controller.handleNotification(terminal503());
   controller.handleNotification(blockedGoal());
   assert.equal(timers.length, 1);
-  assert.equal(timers[0].delayMs, 30_000);
+  assert.equal(timers[0].delayMs, 0);
   const defaultTimer = timers[0];
 
   controller.handleNotification(modelAtCapacity());
@@ -866,6 +891,121 @@ test("continues an ordinary model-capacity thread immediately without a probe", 
   ]);
 });
 
+test("routes a model-capacity sub-agent recovery to its active parent turn", async () => {
+  const { controller, timers, requests } = createHarness({ goalStatus: null });
+  controller.handleNotification(threadStarted("thread-parent"));
+  controller.handleNotification(threadStarted("thread-1", {
+    parentThreadId: "thread-parent",
+    canAcceptDirectInput: false,
+  }));
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-parent", turn: { id: "turn-parent" } },
+  });
+
+  controller.handleNotification(modelAtCapacity());
+  controller.handleNotification(failedTurn());
+  await timers[0].callback();
+
+  assert.deepEqual(requests, [
+    { method: "thread/goal/get", params: { threadId: "thread-1" } },
+    {
+      method: "turn/steer",
+      params: {
+        threadId: "thread-parent",
+        expectedTurnId: "turn-parent",
+        input: [{
+          type: "text",
+          text: parentContinuePromptForTest("thread-1"),
+        }],
+      },
+    },
+  ]);
+});
+
+test("routes a model-capacity sub-agent recovery to an idle parent thread", async () => {
+  const { controller, timers, requests } = createHarness({ goalStatus: null });
+  controller.handleNotification(threadStarted("thread-parent"));
+  controller.handleNotification(threadStarted("thread-1", {
+    parentThreadId: "thread-parent",
+    canAcceptDirectInput: false,
+  }));
+
+  controller.handleNotification(modelAtCapacity());
+  controller.handleNotification(failedTurn());
+  await timers[0].callback();
+
+  assert.deepEqual(requests, [
+    { method: "thread/goal/get", params: { threadId: "thread-1" } },
+    {
+      method: "turn/start",
+      params: {
+        threadId: "thread-parent",
+        input: [{
+          type: "text",
+          text: parentContinuePromptForTest("thread-1"),
+        }],
+      },
+    },
+  ]);
+});
+
+test("routes a failed 503 sub-agent to its parent after model recovery", async () => {
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: {
+      beginRecoveryCheck() {},
+      waitForRecovery: async () => "recovered-after-false",
+    },
+  });
+  controller.handleNotification(threadStarted("thread-parent"));
+  controller.handleNotification(threadStarted("thread-1", {
+    parentThreadId: "thread-parent",
+    canAcceptDirectInput: false,
+  }));
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-parent", turn: { id: "turn-parent" } },
+  });
+
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+  assert.equal(timers[0].delayMs, 0);
+  await timers[0].callback();
+
+  assert.deepEqual(requests.at(-1), {
+    method: "turn/steer",
+    params: {
+      threadId: "thread-parent",
+      expectedTurnId: "turn-parent",
+      input: [{
+        type: "text",
+        text: parentContinuePromptForTest("thread-1"),
+      }],
+    },
+  });
+});
+
+test("does not advance ordinary backoff after model-capacity recovery", async () => {
+  const { controller, timers, goals } = createHarness();
+  controller.handleNotification(modelAtCapacity());
+  controller.handleNotification(blockedGoal());
+  await timers[0].callback();
+  assert.equal(controller.threads.get("thread-1")?.attempt, 0);
+
+  goals.set("thread-1", { status: "blocked" });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-2" } },
+  });
+  controller.handleNotification(terminal503("turn-2"));
+  const turnTwoBlocked = blockedGoal();
+  turnTwoBlocked.params.turnId = "turn-2";
+  controller.handleNotification(turnTwoBlocked);
+
+  assert.equal(timers[1].delayMs, 30_000);
+});
+
 test("checks the current goal before resuming", async () => {
   const { controller, timers, requests, goals } = createHarness();
   controller.handleNotification(terminal503());
@@ -902,6 +1042,18 @@ test("waits for model recovery before resuming a goal", async () => {
     "thread/goal/get",
     "thread/goal/set",
   ]);
+});
+
+test("lets the model recovery gate own the initial resume timing", () => {
+  const gate = deferred();
+  const { controller, timers } = createHarness({
+    recoveryGate: { waitForRecovery: () => gate.promise },
+  });
+
+  controller.handleNotification(terminal503());
+  controller.handleNotification(blockedGoal());
+
+  assert.equal(timers[0].delayMs, 0);
 });
 
 test("continues a failed ordinary thread after model recovery", async () => {
@@ -994,7 +1146,7 @@ test("uses neutral recovery logs for a failed ordinary thread", async () => {
   assert.equal(
     logs.some(
       ({ message }) =>
-        message === "Thread thread-1/turn-1 recovery scheduled in 30000ms",
+        message === "Thread thread-1/turn-1 recovery scheduled in 0ms",
     ),
     true,
   );
@@ -1309,7 +1461,7 @@ test("continues a retrying ordinary thread that fails before its interrupt", asy
 
   assert.equal(interruptTimer.cancelled, true);
   assert.equal(timers.length, 2);
-  assert.equal(timers[1].delayMs, 30_000);
+  assert.equal(timers[1].delayMs, 0);
   await interruptTimer.callback();
   assert.equal(
     requests.some(({ method }) => method === "turn/interrupt"),
