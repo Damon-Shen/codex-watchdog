@@ -79,6 +79,67 @@ codex-watchdog resume
 codex-watchdog resume --all
 ```
 
+### 启用中转站探针
+
+探针默认关闭。使用默认的 AI INPUT 状态接口和 `gpt-5.6-sol` 模型时，只需在启动
+watchdog 的同一个命令中设置 `CODEX_WATCHDOG_PROBE_ENABLED=true`。
+
+macOS / Linux，启动新的 Codex：
+
+```bash
+CODEX_WATCHDOG_PROBE_ENABLED=true \
+codex-watchdog --dangerously-bypass-approvals-and-sandbox
+```
+
+恢复当前工作区最近的会话：
+
+```bash
+CODEX_WATCHDOG_PROBE_ENABLED=true \
+codex-watchdog --dangerously-bypass-approvals-and-sandbox resume
+```
+
+也可以在 `resume` 后传入明确的会话 ID：
+
+```bash
+CODEX_WATCHDOG_PROBE_ENABLED=true \
+codex-watchdog --dangerously-bypass-approvals-and-sandbox resume SESSION_ID
+```
+
+PowerShell：
+
+```powershell
+$env:CODEX_WATCHDOG_PROBE_ENABLED = "true"
+codex-watchdog --dangerously-bypass-approvals-and-sandbox resume
+```
+
+Windows CMD：
+
+```bat
+set CODEX_WATCHDOG_PROBE_ENABLED=true
+codex-watchdog --dangerously-bypass-approvals-and-sandbox resume
+```
+
+需要指定工作目录时，将 `-C` 放在普通 Codex 参数之前：
+
+```bash
+CODEX_WATCHDOG_PROBE_ENABLED=true \
+codex-watchdog -C /path/to/project --dangerously-bypass-approvals-and-sandbox resume
+```
+
+`--dangerously-bypass-approvals-and-sandbox` 会让 Codex 以无人值守的 YOLO 模式运行；需要
+保留审批和沙箱时，直接移除该参数。探针配置只在 watchdog 进程启动时读取，修改环境变量
+后必须重新启动 watchdog，已经运行的进程不会热加载新配置。
+
+如果状态接口、目标模型或确认间隔不同，可以同时覆盖默认值：
+
+```bash
+CODEX_WATCHDOG_PROBE_ENABLED=true \
+CODEX_WATCHDOG_PROBE_URL=https://status.input.im/api/status \
+CODEX_WATCHDOG_TARGET_MODEL=gpt-5.6-sol \
+CODEX_WATCHDOG_PROBE_INTERVAL_MS=30000 \
+codex-watchdog --dangerously-bypass-approvals-and-sandbox resume
+```
+
 不要手动传入 `--remote`。代理地址由 watchdog 创建，额外的 `--remote` 会绕过恢复链，
 因此启动器会直接拒绝。
 
