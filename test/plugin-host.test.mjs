@@ -134,3 +134,28 @@ test("rejects non-absolute request URLs", async () => {
   await assert.rejects(() => host.http.request({ url: "/status" }), /absolute URL/i);
   host.close();
 });
+
+test("exposes bound built-in balance adapters to plugins", async () => {
+  const requests = [];
+  const host = createPluginHost({
+    config: {
+      ...config,
+      baseUrl: "https://relay.example",
+    },
+    fetchImpl: async (url, init) => {
+      requests.push({ url, authorization: init.headers.authorization });
+      return new Response(JSON.stringify({ remaining: 3 }), { status: 200 });
+    },
+    logger: quietLogger,
+  });
+
+  assert.deepEqual(await host.balanceAdapters.sub2api(), [
+    { accountId: "primary", balance: 3 },
+  ]);
+  assert.equal(typeof host.balanceAdapters.newapi, "function");
+  assert.deepEqual(requests, [{
+    url: "https://relay.example/v1/usage",
+    authorization: "Bearer secret-key",
+  }]);
+  host.close();
+});

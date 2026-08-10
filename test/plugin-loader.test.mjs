@@ -11,6 +11,21 @@ import {
   validatePluginName,
 } from "../src/plugin-loader.mjs";
 
+function validConfig(overrides = {}) {
+  return {
+    apiVersion: 1,
+    module: "./relay.mjs",
+    stack: "sub2api",
+    baseUrl: "https://relay.example",
+    apiKeys: [{ id: "primary", value: "secret" }],
+    model: "gpt-test",
+    probeIntervalMs: 100,
+    requestTimeoutMs: 50,
+    balancePolicy: { mode: "any", minimum: 1 },
+    ...overrides,
+  };
+}
+
 test("validates plugin names and rejects path-like names", () => {
   assert.equal(validatePluginName("relay-v1_2"), "relay-v1_2");
   for (const name of ["", "../relay", "relay/name", "relay\\name", "relay name", "."]) {
@@ -45,29 +60,31 @@ test("resolves Windows APPDATA config path", () => {
 test("loads a relative local ESM module from a validated config", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "watchdog-plugin-"));
   const configPath = path.join(root, ".config", "codex-watchdog", "plugins", "relay.json");
+  const config = validConfig();
   await mkdir(path.dirname(configPath), { recursive: true });
-  await writeFile(configPath, JSON.stringify({ apiVersion: 1, module: "./relay.mjs" }));
+  await writeFile(configPath, JSON.stringify(config));
   await writeFile(path.join(path.dirname(configPath), "relay.mjs"),
     "export default ({ config, host }) => ({ apiVersion: 1, checkModel: async () => ({ config, host }) });");
 
-  const plugin = await loadPlugin("relay", {
+  const runtime = await loadPlugin("relay", {
     env: { HOME: root },
     platform: "linux",
     host: { marker: true },
   });
-  assert.equal(plugin.apiVersion, 1);
-  assert.deepEqual(await plugin.checkModel(), {
-    config: { apiVersion: 1, module: "./relay.mjs" },
+  assert.equal(runtime.plugin.apiVersion, 1);
+  assert.deepEqual(await runtime.plugin.checkModel(), {
+    config,
     host: { marker: true },
   });
+  await runtime.close();
 });
 
 test("supports injected package resolution and import", async () => {
   const configPath = "/home/test/.config/codex-watchdog/plugins/relay.json";
   const calls = [];
-  const plugin = await loadPlugin("relay", {
+  const runtime = await loadPlugin("relay", {
     configPath,
-    readFile: async () => JSON.stringify({ apiVersion: 1, module: "relay-package" }),
+    readFile: async () => JSON.stringify(validConfig({ module: "relay-package" })),
     resolveModule: (specifier, parent) => {
       calls.push([specifier, parent]);
       return "/pkg/relay.mjs";
@@ -78,8 +95,9 @@ test("supports injected package resolution and import", async () => {
     },
     host: "host",
   });
-  assert.equal(plugin.checkModel(), "host");
+  assert.equal(runtime.plugin.checkModel(), "host");
   assert.deepEqual(calls, [["relay-package", configPath], ["import", pathToFileURL("/pkg/relay.mjs").href]]);
+  await runtime.close();
 });
 
 test("converts POSIX local paths with URL-significant characters before import", async () => {
@@ -87,7 +105,7 @@ test("converts POSIX local paths with URL-significant characters before import",
   let imported;
   await loadPlugin("relay", {
     configPath: "/tmp/config/relay.json",
-    readFile: async () => JSON.stringify({ apiVersion: 1, module: modulePath }),
+    readFile: async () => JSON.stringify(validConfig({ module: modulePath })),
     importModule: async (specifier) => {
       imported = specifier;
       return { default: () => ({ apiVersion: 1, checkModel: () => {} }) };
@@ -103,7 +121,7 @@ test("converts Windows local paths through the injectable file URL boundary", as
   await loadPlugin("relay", {
     platform: "win32",
     configPath: "C:\\Users\\test\\plugins\\config\\relay.json",
-    readFile: async () => JSON.stringify({ apiVersion: 1, module: "..\\relay #v1%.mjs" }),
+    readFile: async () => JSON.stringify(validConfig({ module: "..\\relay #v1%.mjs" })),
     pathToFileURLImpl: (value) => {
       conversions.push(value);
       return "file:///C:/Users/test/plugins/relay%20%23v1%25.mjs";
@@ -140,7 +158,7 @@ test("rejects missing, invalid, and incompatible plugin configurations", async (
 test("rejects modules without a factory or with invalid plugin APIs", async () => {
   const base = {
     configPath: "/tmp/relay.json",
-    readFile: async () => JSON.stringify({ apiVersion: 1, module: "relay" }),
+    readFile: async () => JSON.stringify(validConfig({ module: "relay" })),
     resolveModule: () => "/pkg/relay.mjs",
     importModule: async () => ({ default: "not a factory" }),
   };
@@ -153,4 +171,72 @@ test("rejects modules without a factory or with invalid plugin APIs", async () =
     ...base,
     importModule: async () => ({ default: () => ({ apiVersion: 1 }) }),
   }), /checkModel/i);
+});
+
+test("assembles a normalized plugin runtime", async () => {
+  const runtime = await loadPlugin("relay", {
+    configPath: "/tmp/relay.json",
+    readFile: async () => JSON.stringify(validConfig({
+      module: "relay-package",
+      stack: "custom",
+      apiKeys: [{ id: "first", value: "secret" }],
+    })),
+    resolveModule: () => "/pkg/relay.mjs",
+    importModule: async () => ({
+      default: () => ({
+        apiVersion: 1,
+        checkModel: async () => true,
+        checkBalances: async () => [{ accountId: "first", balance: 2 }],
+      }),
+    }),
+    host: { logger: { warn() {} } },
+  });
+
+  assert.equal(runtime.plugin.apiVersion, 1);
+  assert.equal(await runtime.checkBalances({}), "available");
+  assert.equal(typeof runtime.recoveryGate.beginRecoveryCheck, "function");
+  await runtime.close();
+});
+
+test("rejects invalid runtime settings before creating a plugin", async () => {
+  const cases = [
+    [validConfig({ stack: "other" }), /stack/i],
+    [validConfig({ baseUrl: "/relative" }), /baseUrl/i],
+    [validConfig({ model: "" }), /model/i],
+    [validConfig({ probeIntervalMs: 0 }), /probeIntervalMs/i],
+    [validConfig({ requestTimeoutMs: -1 }), /requestTimeoutMs/i],
+    [validConfig({ apiKeys: [] }), /apiKeys/i],
+    [validConfig({
+      apiKeys: [
+        { id: "same", value: "first" },
+        { id: "same", value: "second" },
+      ],
+    }), /duplicate/i],
+    [validConfig({ balancePolicy: { mode: "other", minimum: 1 } }), /balance policy/i],
+  ];
+
+  for (const [config, pattern] of cases) {
+    await assert.rejects(() => loadPlugin("relay", {
+      configPath: "/tmp/relay.json",
+      readFile: async () => JSON.stringify(config),
+      resolveModule: () => "/pkg/relay.mjs",
+      importModule: async () => ({
+        default: () => ({ apiVersion: 1, checkModel: async () => true }),
+      }),
+    }), pattern);
+  }
+});
+
+test("requires a balance implementation for custom stacks", async () => {
+  await assert.rejects(() => loadPlugin("relay", {
+    configPath: "/tmp/relay.json",
+    readFile: async () => JSON.stringify(validConfig({
+      module: "relay-package",
+      stack: "custom",
+    })),
+    resolveModule: () => "/pkg/relay.mjs",
+    importModule: async () => ({
+      default: () => ({ apiVersion: 1, checkModel: async () => true }),
+    }),
+  }), /custom.*checkBalances/i);
 });

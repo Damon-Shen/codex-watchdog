@@ -1,3 +1,5 @@
+import { queryNewApiBalances, querySub2ApiBalances } from "./balance-adapters.mjs";
+
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -80,6 +82,20 @@ export function createPluginHost({ config = {}, fetchImpl = fetch, logger = cons
     http: { request },
     logger: safeLogger,
     signal: lifecycle.signal,
+    balanceAdapters: {
+      sub2api: ({ signal } = {}) => querySub2ApiBalances({
+        config,
+        http: { request },
+        signal,
+        logger: safeLogger,
+      }),
+      newapi: ({ signal } = {}) => queryNewApiBalances({
+        config,
+        http: { request },
+        signal,
+        logger: safeLogger,
+      }),
+    },
     close() {
       if (closed) return;
       closed = true;

@@ -3,6 +3,11 @@ import { readFile as readFileAsync } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { aggregateBalances, normalizeBalances, validateBalancePolicy } from "./balance.mjs";
+import { selectBalanceAdapter } from "./balance-adapters.mjs";
+import { ModelRecoveryGate } from "./model-recovery-gate.mjs";
+import { createPluginHost } from "./plugin-host.mjs";
+
 const CONFIG_API_VERSION = 1;
 
 export function validatePluginName(name) {
@@ -29,6 +34,42 @@ export function resolvePluginConfigPath(
 
 function isLocalModule(moduleName, pathApi) {
   return moduleName.startsWith(".") || pathApi.isAbsolute(moduleName);
+}
+
+function validateRuntimeConfig(name, config) {
+  if (!["sub2api", "newapi", "custom"].includes(config.stack)) {
+    throw new Error(`Plugin ${name} config stack is invalid`);
+  }
+  try {
+    const baseUrl = new URL(config.baseUrl);
+    if (!new Set(["http:", "https:"]).has(baseUrl.protocol)) throw new Error();
+  } catch {
+    throw new Error(`Plugin ${name} config baseUrl must be an absolute HTTP URL`);
+  }
+  if (typeof config.model !== "string" || config.model.trim() === "") {
+    throw new Error(`Plugin ${name} config model must be non-empty`);
+  }
+  if (!Number.isFinite(config.probeIntervalMs) || config.probeIntervalMs <= 0) {
+    throw new Error(`Plugin ${name} config probeIntervalMs must be positive`);
+  }
+  if (!Number.isFinite(config.requestTimeoutMs) || config.requestTimeoutMs <= 0) {
+    throw new Error(`Plugin ${name} config requestTimeoutMs must be positive`);
+  }
+  if (!Array.isArray(config.apiKeys) || config.apiKeys.length === 0) {
+    throw new Error(`Plugin ${name} config apiKeys must not be empty`);
+  }
+  const ids = new Set();
+  for (const apiKey of config.apiKeys) {
+    if (
+      typeof apiKey?.id !== "string" || apiKey.id.length === 0 ||
+      typeof apiKey?.value !== "string" || apiKey.value.length === 0
+    ) {
+      throw new Error(`Plugin ${name} config API keys require id and value`);
+    }
+    if (ids.has(apiKey.id)) throw new Error(`Plugin ${name} config has duplicate API key ID`);
+    ids.add(apiKey.id);
+  }
+  validateBalancePolicy(config.balancePolicy);
 }
 
 export async function loadPlugin(
@@ -61,6 +102,7 @@ export async function loadPlugin(
   if (typeof config.module !== "string" || config.module.trim() === "") {
     throw new Error(`Plugin ${name} config module must be non-empty`);
   }
+  validateRuntimeConfig(name, config);
 
   const pathApi = platform === "win32" ? path.win32 : path;
   let moduleSpecifier = config.module;
@@ -76,7 +118,8 @@ export async function loadPlugin(
     if (typeof loaded?.default !== "function") {
       throw new Error(`Plugin ${name} module must default-export a factory`);
     }
-    const plugin = await loaded.default({ config, host });
+    const pluginHost = host ?? createPluginHost({ config });
+    const plugin = await loaded.default({ config, host: pluginHost });
     if (!plugin || typeof plugin !== "object") {
       throw new Error(`Plugin ${name} factory must return a plugin object`);
     }
@@ -86,7 +129,41 @@ export async function loadPlugin(
     if (typeof plugin.checkModel !== "function") {
       throw new Error(`Plugin ${name} must provide checkModel`);
     }
-    return plugin;
+    const queryBalances = plugin.checkBalances?.bind(plugin)
+      ?? selectBalanceAdapter(config.stack);
+    const accountIds = config.apiKeys.map(({ id }) => id);
+    const checkBalances = async (context = {}) => {
+      let records;
+      try {
+        records = await queryBalances({
+          ...context,
+          config,
+          http: pluginHost.http,
+          logger: pluginHost.logger,
+        });
+      } catch (error) {
+        pluginHost.logger?.warn?.(`Balance query failed: ${error?.message ?? error}`);
+        records = accountIds.map((accountId) => ({ accountId, balance: null }));
+      }
+      return aggregateBalances(normalizeBalances(records, accountIds), config.balancePolicy);
+    };
+    const recoveryGate = new ModelRecoveryGate({
+      checkModel: plugin.checkModel.bind(plugin),
+      intervalMs: config.probeIntervalMs,
+      logger: pluginHost.logger,
+    });
+    return {
+      config,
+      plugin,
+      host: pluginHost,
+      checkBalances,
+      recoveryGate,
+      async close() {
+        recoveryGate.close();
+        await plugin.close?.();
+        pluginHost.close?.();
+      },
+    };
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("Plugin ")) throw error;
     throw new Error(`Could not load plugin ${name}: ${error.message}`);
