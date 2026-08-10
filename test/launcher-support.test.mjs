@@ -6,11 +6,25 @@ import {
   allocateDistinctTcpPorts,
   allocateTcpPort,
   ensureWorkingDirectoryArg,
+  extractWatchdogArgs,
   parseNonNegativeMilliseconds,
   resolveCodexEntrypoint,
   validateForwardedArgs,
   waitForHttpReady,
 } from "../src/launcher-support.mjs";
+
+test("extracts one plugin option before the delimiter", () => {
+  assert.deepEqual(extractWatchdogArgs(["resume", "--plugin", "relay", "--", "--plugin", "text"]), {
+    pluginName: "relay",
+    forwardedArgs: ["resume", "--", "--plugin", "text"],
+  });
+  assert.deepEqual(extractWatchdogArgs(["resume"]), { pluginName: undefined, forwardedArgs: ["resume"] });
+});
+
+test("rejects duplicate or missing plugin values", () => {
+  assert.throws(() => extractWatchdogArgs(["--plugin", "one", "--plugin", "two"]), /duplicate/i);
+  assert.throws(() => extractWatchdogArgs(["--plugin"]), /value/i);
+});
 
 test("resolves an explicit Codex entrypoint before npm", () => {
   const result = resolveCodexEntrypoint({

@@ -73,6 +73,30 @@ function argsBeforeOptionDelimiter(args) {
   return delimiterIndex === -1 ? args : args.slice(0, delimiterIndex);
 }
 
+export function extractWatchdogArgs(args) {
+  const delimiterIndex = args.indexOf("--");
+  const boundary = delimiterIndex === -1 ? args.length : delimiterIndex;
+  let pluginName;
+  const forwardedArgs = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if (index === delimiterIndex) {
+      forwardedArgs.push(...args.slice(index));
+      break;
+    }
+    if (args[index] !== "--plugin") {
+      forwardedArgs.push(args[index]);
+      continue;
+    }
+    if (pluginName !== undefined) throw new Error("Duplicate --plugin option");
+    if (index + 1 >= boundary || args[index + 1] === "--plugin" || args[index + 1] === "--") {
+      throw new Error("--plugin requires a value");
+    }
+    pluginName = args[index + 1];
+    index += 1;
+  }
+  return { pluginName, forwardedArgs };
+}
+
 export function validateForwardedArgs(args) {
   const remoteArg = argsBeforeOptionDelimiter(args).find(
     (arg) => arg === "--remote" || arg.startsWith("--remote="),
