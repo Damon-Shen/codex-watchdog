@@ -1085,6 +1085,34 @@ test("continues a failed ordinary thread after model recovery", async () => {
   });
 });
 
+test("continues an observed ordinary turn while an older goal remains paused", async () => {
+  const gate = deferred();
+  const { controller, timers, requests, goals } = createHarness({
+    goalStatus: "paused",
+    recoveryGate: { waitForRecovery: () => gate.promise },
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+  const recovery = timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(requests.map(({ method }) => method), ["thread/goal/get"]);
+  gate.resolve();
+  await recovery;
+
+  assert.deepEqual(requests.map(({ method }) => method), [
+    "thread/goal/get",
+    "thread/goal/get",
+    "turn/start",
+  ]);
+  assert.equal(goals.get("thread-1").status, "paused");
+});
+
 test("cancels ordinary continuation when a user starts a new turn", async () => {
   const gate = deferred();
   const { controller, timers, requests } = createHarness({
@@ -1357,6 +1385,43 @@ test("interrupts and continues a retrying ordinary thread", async () => {
     "thread/goal/get",
     "turn/start",
   ]);
+});
+
+test("interrupts an observed ordinary turn while an older goal remains paused", async () => {
+  const gate = deferred();
+  const { controller, timers, requests } = createHarness({
+    goalStatus: "paused",
+    recoveryGate: { waitForRecovery: () => gate.promise },
+    interruptAfterMs: 10,
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(retrying503());
+
+  await timers[0].callback();
+  assert.deepEqual(requests, [
+    { method: "thread/goal/get", params: { threadId: "thread-1" } },
+    {
+      method: "turn/interrupt",
+      params: { threadId: "thread-1", turnId: "turn-1" },
+    },
+  ]);
+
+  controller.handleNotification({
+    method: "turn/completed",
+    params: {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "interrupted", error: null },
+    },
+  });
+  const recovery = timers[1].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  gate.resolve();
+  await recovery;
+
+  assert.equal(requests.at(-1).method, "turn/start");
 });
 
 test("continues after a dispatched interrupt response is lost", async () => {

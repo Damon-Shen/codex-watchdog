@@ -43,6 +43,7 @@ function newThreadState() {
     finishedTurns: new Set(),
     pending: null,
     activeTurnId: null,
+    lastObservedTurnId: null,
     interruptingTurnId: null,
     turnGeneration: 0,
     attempt: 0,
@@ -157,6 +158,7 @@ export class GoalWatchdogController {
     if (!threadId || !turnId) return;
 
     const state = this.#state(threadId);
+    state.lastObservedTurnId = turnId;
     if (["compact-request", "compact-wait"].includes(state.pending?.kind)) {
       if (
         state.pending.compactionTurnId &&
@@ -608,9 +610,12 @@ export class GoalWatchdogController {
       }
 
       const goal = getExplicitGoal(response);
+      const recoveryMode = this.#recoveryModeForTurn(state, turnId);
       const canInterrupt =
         INTERRUPTABLE_GOAL_STATUSES.has(goal?.status) ||
-        (goal === null && Boolean(this.recoveryGate));
+        (goal === null && Boolean(this.recoveryGate)) ||
+        (goal?.status === "paused" &&
+          this.#canContinueObservedTurn(state, turnId, recoveryMode));
       if (!canInterrupt) {
         this.#releasePending(state, pending);
         this.logger.info(
@@ -646,14 +651,29 @@ export class GoalWatchdogController {
     this.#scheduleResume(threadId, turnId, state, true);
   }
 
-  #selectRecoveryAction(goal, resumableStatuses, recoveryMode) {
+  #selectRecoveryAction(
+    goal,
+    resumableStatuses,
+    recoveryMode,
+    allowPausedContinuation,
+  ) {
     if (goal === null) {
       return this.recoveryGate || recoveryMode === "immediate"
         ? "continue-turn"
         : null;
     }
+    if (goal?.status === "paused" && allowPausedContinuation) {
+      return "continue-turn";
+    }
     if (goal === undefined) return null;
     return resumableStatuses.has(goal.status) ? "resume-goal" : null;
+  }
+
+  #canContinueObservedTurn(state, turnId, recoveryMode) {
+    return (
+      state.lastObservedTurnId === turnId &&
+      (Boolean(this.recoveryGate) || recoveryMode === "immediate")
+    );
   }
 
   async #resolveRecoveryAction(threadId, state, pending, resumableStatuses) {
@@ -662,7 +682,17 @@ export class GoalWatchdogController {
     let response = await this.sendRequest("thread/goal/get", { threadId });
     if (!this.#isCurrentPending(threadId, state, pending)) return null;
     let goal = getExplicitGoal(response);
-    let action = this.#selectRecoveryAction(goal, resumableStatuses, recoveryMode);
+    const allowPausedContinuation = this.#canContinueObservedTurn(
+      state,
+      pending.turnId,
+      recoveryMode,
+    );
+    let action = this.#selectRecoveryAction(
+      goal,
+      resumableStatuses,
+      recoveryMode,
+      allowPausedContinuation,
+    );
     if (recoveryMode === "immediate" || !action || !this.recoveryGate) {
       return { action, status: goal?.status, gateOutcome };
     }
@@ -673,7 +703,12 @@ export class GoalWatchdogController {
     response = await this.sendRequest("thread/goal/get", { threadId });
     if (!this.#isCurrentPending(threadId, state, pending)) return null;
     goal = getExplicitGoal(response);
-    action = this.#selectRecoveryAction(goal, resumableStatuses, recoveryMode);
+    action = this.#selectRecoveryAction(
+      goal,
+      resumableStatuses,
+      recoveryMode,
+      allowPausedContinuation,
+    );
     return { action, status: goal?.status, gateOutcome };
   }
 

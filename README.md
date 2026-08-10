@@ -20,6 +20,10 @@ Codex Goal Watchdog 是一个本地启动器，用来降低 Codex `/goal` 因短
 
 它不会绕过人工暂停、认证失败、用量限制、token budget、额度不足或已经完成的 goal。
 
+如果 goal 之前已被人工暂停，但用户之后明确启动了新的普通 turn，watchdog 只会在该
+turn 出现可恢复错误时继续这个普通 turn，不会把原 goal 改回 `active`。恢复等待期间收到
+新的人工暂停事件时，仍会取消恢复。
+
 ## 环境要求
 
 - Node.js 22 或更高版本。
