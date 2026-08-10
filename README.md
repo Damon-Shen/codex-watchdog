@@ -153,6 +153,11 @@ test/       单元测试、代理集成测试和 live smoke test
 docs/adr/   架构决策记录
 ```
 
+## 社区鸣谢
+[Linux.do](https://linux.do)
+
 ## 许可证
 
 本项目使用 [MIT License](LICENSE)。
+
+
