@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import {
@@ -78,7 +79,42 @@ test("supports injected package resolution and import", async () => {
     host: "host",
   });
   assert.equal(plugin.checkModel(), "host");
-  assert.deepEqual(calls, [["relay-package", configPath], ["import", "/pkg/relay.mjs"]]);
+  assert.deepEqual(calls, [["relay-package", configPath], ["import", pathToFileURL("/pkg/relay.mjs").href]]);
+});
+
+test("converts POSIX local paths with URL-significant characters before import", async () => {
+  const modulePath = "/tmp/plugin #relay%2Fv1.mjs";
+  let imported;
+  await loadPlugin("relay", {
+    configPath: "/tmp/config/relay.json",
+    readFile: async () => JSON.stringify({ apiVersion: 1, module: modulePath }),
+    importModule: async (specifier) => {
+      imported = specifier;
+      return { default: () => ({ apiVersion: 1, checkModel: () => {} }) };
+    },
+  });
+  assert.equal(imported, pathToFileURL(modulePath).href);
+});
+
+test("converts Windows local paths through the injectable file URL boundary", async () => {
+  const modulePath = "C:\\Users\\test\\plugins\\relay #v1%.mjs";
+  const conversions = [];
+  let imported;
+  await loadPlugin("relay", {
+    platform: "win32",
+    configPath: "C:\\Users\\test\\plugins\\config\\relay.json",
+    readFile: async () => JSON.stringify({ apiVersion: 1, module: "..\\relay #v1%.mjs" }),
+    pathToFileURLImpl: (value) => {
+      conversions.push(value);
+      return "file:///C:/Users/test/plugins/relay%20%23v1%25.mjs";
+    },
+    importModule: async (specifier) => {
+      imported = specifier;
+      return { default: () => ({ apiVersion: 1, checkModel: () => {} }) };
+    },
+  });
+  assert.deepEqual(conversions, [modulePath]);
+  assert.equal(imported, "file:///C:/Users/test/plugins/relay%20%23v1%25.mjs");
 });
 
 test("rejects missing, invalid, and incompatible plugin configurations", async () => {

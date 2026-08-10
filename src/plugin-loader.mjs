@@ -1,6 +1,7 @@
 import { createRequire } from "node:module";
 import { readFile as readFileAsync } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const CONFIG_API_VERSION = 1;
 
@@ -38,6 +39,7 @@ export async function loadPlugin(
     configPath: suppliedConfigPath,
     readFile = (filePath) => readFileAsync(filePath, "utf8"),
     resolveModule,
+    pathToFileURLImpl = (filePath) => pathToFileURL(filePath).href,
     importModule = (specifier) => import(specifier),
     host,
   } = {},
@@ -70,7 +72,7 @@ export async function loadPlugin(
       const resolver = resolveModule ?? requireFromConfig.resolve.bind(requireFromConfig);
       moduleSpecifier = resolver(moduleSpecifier, configPath);
     }
-    const loaded = await importModule(moduleSpecifier);
+    const loaded = await importModule(pathToFileURLImpl(moduleSpecifier));
     if (typeof loaded?.default !== "function") {
       throw new Error(`Plugin ${name} module must default-export a factory`);
     }
