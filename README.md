@@ -169,6 +169,11 @@ docs/adr/   架构决策记录
 docs/plugins/ 插件使用说明与完整示例
 ```
 
+## 社区鸣谢
+[Linux.do](https://linux.do)
+
 ## 许可证
 
 本项目使用 [MIT License](LICENSE)。
+
+
