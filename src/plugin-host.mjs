@@ -4,7 +4,7 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function createRedactor(config) {
+export function createPluginRedactor(config) {
   const secrets = (config?.apiKeys ?? [])
     .map((entry) => entry?.value)
     .filter((value) => typeof value === "string" && value.length > 0)
@@ -33,7 +33,7 @@ function validateRequestUrl(value) {
 
 export function createPluginHost({ config = {}, fetchImpl = fetch, logger = console } = {}) {
   const lifecycle = new AbortController();
-  const redact = createRedactor(config);
+  const redact = createPluginRedactor(config);
   let closed = false;
   const safeLogger = Object.fromEntries(["info", "warn", "error"].map((level) => [
     level,

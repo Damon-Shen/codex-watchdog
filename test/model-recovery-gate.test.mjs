@@ -118,6 +118,33 @@ test("treats check errors as unknown samples and keeps polling", async () => {
   gate.close();
 });
 
+test("times out a hanging model check and keeps polling", async () => {
+  let requestSignal;
+  const scheduler = createScheduler();
+  const warnings = [];
+  const gate = new ModelRecoveryGate({
+    intervalMs: 10,
+    timeoutMs: 5,
+    schedule: scheduler.schedule,
+    cancel: scheduler.cancel,
+    checkModel: ({ signal }) => {
+      requestSignal = signal;
+      return new Promise(() => {});
+    },
+    logger: { warn: (message) => warnings.push(message) },
+  });
+
+  gate.beginRecoveryCheck();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  assert.equal(requestSignal.aborted, true);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /timeout/i);
+  assert.equal(scheduler.timers.length, 1);
+  assert.equal(scheduler.timers[0].delayMs, 10);
+  gate.close();
+});
+
 test("does not overlap model checks", async () => {
   const pending = deferred();
   let active = 0;
@@ -229,4 +256,8 @@ test("cancels one recovery cycle without closing the reusable gate", async () =>
 test("validates constructor arguments", () => {
   assert.throws(() => new ModelRecoveryGate({ intervalMs: 1 }), /checkModel/);
   assert.throws(() => new ModelRecoveryGate({ checkModel() {}, intervalMs: 0 }), /intervalMs/);
+  assert.throws(
+    () => new ModelRecoveryGate({ checkModel() {}, intervalMs: 1, timeoutMs: 0 }),
+    /timeoutMs/,
+  );
 });

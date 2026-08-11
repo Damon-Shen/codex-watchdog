@@ -513,6 +513,14 @@ export class GoalWatchdogController {
       await this.#interruptIfStillEligible(threadId, turnId, state, pending);
     }, this.interruptAfterMs);
     state.pending = pending;
+    if (this.recoveryGate && pending.failure?.statusCode === 429) {
+      pending.pluginRecoveryPromise = this.#waitForPluginRecovery(
+        threadId,
+        turnId,
+        state,
+        pending,
+      );
+    }
     this.logger.info(
       `Transient retry for ${threadId}/${turnId}; interrupt in ${this.interruptAfterMs}ms`,
     );
@@ -522,7 +530,9 @@ export class GoalWatchdogController {
     if (state.interruptAttempts.has(turnId)) return;
     let interruptSent = false;
 
-    if (!await this.#waitForPluginRecovery(threadId, turnId, state, pending)) return;
+    const pluginRecovery = pending.pluginRecoveryPromise ??
+      this.#waitForPluginRecovery(threadId, turnId, state, pending);
+    if (!await pluginRecovery) return;
 
     try {
       const response = await this.sendRequest("thread/goal/get", { threadId });
@@ -539,8 +549,7 @@ export class GoalWatchdogController {
       const goal = getExplicitGoal(response);
       const canInterrupt =
         INTERRUPTABLE_GOAL_STATUSES.has(goal?.status) ||
-        (goal === null && Boolean(this.recoveryGate)) ||
-        (goal?.status === "paused" && state.lastObservedTurnId === turnId);
+        (goal === null && Boolean(this.recoveryGate));
       if (!canInterrupt) {
         this.#releasePending(state, pending);
         this.logger.info(
@@ -623,12 +632,7 @@ export class GoalWatchdogController {
       }
 
       const goal = getExplicitGoal(response);
-      recoveryAction = this.#selectRecoveryAction(
-        goal,
-        requireBlocked,
-        state,
-        turnId,
-      );
+      recoveryAction = this.#selectRecoveryAction(goal, requireBlocked);
       if (!recoveryAction) {
         this.#releasePending(state, pending);
         this.logger.info(
@@ -683,11 +687,8 @@ export class GoalWatchdogController {
     }
   }
 
-  #selectRecoveryAction(goal, requireBlocked, state, turnId) {
+  #selectRecoveryAction(goal, requireBlocked) {
     if (goal === null) return this.recoveryGate ? "continue-turn" : null;
-    if (goal?.status === "paused" && state.lastObservedTurnId === turnId) {
-      return "continue-turn";
-    }
     if (goal === undefined) return null;
     const statuses = requireBlocked ? BLOCKED_GOAL_STATUSES : RESUMABLE_GOAL_STATUSES;
     return statuses.has(goal.status) ? "resume-goal" : null;
@@ -743,6 +744,7 @@ export class GoalWatchdogController {
     if (!this.recoveryGate) return true;
     if (pending.failure?.pluginConfirmed === true) return true;
 
+    this.#claimPluginRecovery(threadId, state, pending);
     let balanceStatus = null;
     try {
       if (pending.failure?.statusCode === 429) {
@@ -757,6 +759,7 @@ export class GoalWatchdogController {
           throw new Error(`Invalid balance status: ${balanceStatus}`);
         }
         if (balanceStatus === "insufficient") {
+          this.#releasePluginRecovery(pending);
           this.#releasePending(state, pending);
           state.transientTurns.delete(turnId);
           state.blockedTurns.delete(turnId);
@@ -768,14 +771,12 @@ export class GoalWatchdogController {
         }
       }
 
-      this.#claimPluginRecovery(threadId, state, pending);
       this.recoveryGate.beginRecoveryCheck({
         error: pending.failure?.error ?? null,
         balanceStatus,
       });
       await this.recoveryGate.waitForRecovery();
-      if (this.pluginRecoveryOwner?.pending === pending) this.pluginRecoveryOwner = null;
-      pending.gateActive = false;
+      this.#releasePluginRecovery(pending);
       if (!this.#isCurrentPending(threadId, state, pending)) return false;
       if (pending.failure) {
         pending.failure.pluginConfirmed = true;
@@ -783,8 +784,7 @@ export class GoalWatchdogController {
       }
       return true;
     } catch (error) {
-      if (this.pluginRecoveryOwner?.pending === pending) this.pluginRecoveryOwner = null;
-      pending.gateActive = false;
+      this.#releasePluginRecovery(pending);
       if (!this.#isCurrentPending(threadId, state, pending)) return false;
       this.#releasePending(state, pending);
       this.logger.error(
@@ -805,6 +805,11 @@ export class GoalWatchdogController {
     }
     pending.gateActive = true;
     this.pluginRecoveryOwner = { threadId, state, pending };
+  }
+
+  #releasePluginRecovery(pending) {
+    if (this.pluginRecoveryOwner?.pending === pending) this.pluginRecoveryOwner = null;
+    pending.gateActive = false;
   }
 
   #isCurrentPending(threadId, state, pending) {

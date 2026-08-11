@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { aggregateBalances, normalizeBalances, validateBalancePolicy } from "./balance.mjs";
 import { selectBalanceAdapter } from "./balance-adapters.mjs";
 import { ModelRecoveryGate } from "./model-recovery-gate.mjs";
-import { createPluginHost } from "./plugin-host.mjs";
+import { createPluginHost, createPluginRedactor } from "./plugin-host.mjs";
 
 const CONFIG_API_VERSION = 1;
 
@@ -104,6 +104,7 @@ export async function loadPlugin(
     throw new Error(`Plugin ${name} config module must be non-empty`);
   }
   validateRuntimeConfig(name, config);
+  const redact = createPluginRedactor(config);
 
   const pathApi = platform === "win32" ? path.win32 : path;
   let moduleSpecifier = config.module;
@@ -153,6 +154,7 @@ export async function loadPlugin(
     const recoveryGate = new ModelRecoveryGate({
       checkModel: plugin.checkModel.bind(plugin),
       intervalMs: config.probeIntervalMs,
+      timeoutMs: config.requestTimeoutMs,
       logger: pluginHost.logger,
     });
     return {
@@ -163,16 +165,27 @@ export async function loadPlugin(
       recoveryGate,
       async close() {
         recoveryGate.close();
+        const closeErrors = [];
+        try {
+          pluginHost.close?.();
+        } catch (error) {
+          closeErrors.push(error);
+        }
         try {
           await plugin.close?.();
-        } finally {
-          pluginHost.close?.();
+        } catch (error) {
+          closeErrors.push(error);
+        }
+        if (closeErrors.length > 0) {
+          const message = closeErrors.map((error) => redact(error?.message ?? error)).join("; ");
+          throw new Error(`Plugin ${name} close failed: ${message}`);
         }
       },
     };
   } catch (error) {
     ownedPluginHost?.close?.();
-    if (error instanceof Error && error.message.startsWith("Plugin ")) throw error;
-    throw new Error(`Could not load plugin ${name}: ${error.message}`);
+    const message = redact(error?.message ?? error);
+    if (message.startsWith("Plugin ")) throw new Error(message);
+    throw new Error(`Could not load plugin ${name}: ${message}`);
   }
 }

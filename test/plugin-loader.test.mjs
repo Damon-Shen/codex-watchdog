@@ -173,6 +173,77 @@ test("rejects modules without a factory or with invalid plugin APIs", async () =
   }), /checkModel/i);
 });
 
+test("redacts configured secrets from plugin factory errors", async () => {
+  await assert.rejects(
+    () => loadPlugin("relay", {
+      configPath: "/tmp/relay.json",
+      readFile: async () => JSON.stringify(validConfig()),
+      importModule: async () => ({
+        default: ({ config }) => {
+          throw new Error(`factory rejected ${config.apiKeys[0].value}`);
+        },
+      }),
+    }),
+    (error) => {
+      assert.match(error.message, /\[REDACTED\]/);
+      assert.doesNotMatch(error.message, /secret/);
+      return true;
+    },
+  );
+});
+
+test("redacts configured secrets from plugin close errors", async () => {
+  const runtime = await loadPlugin("relay", {
+    configPath: "/tmp/relay.json",
+    readFile: async () => JSON.stringify(validConfig()),
+    importModule: async () => ({
+      default: ({ config }) => ({
+        apiVersion: 1,
+        checkModel: async () => true,
+        close() {
+          throw new Error(`close rejected ${config.apiKeys[0].value}`);
+        },
+      }),
+    }),
+  });
+
+  await assert.rejects(
+    () => runtime.close(),
+    (error) => {
+      assert.match(error.message, /\[REDACTED\]/);
+      assert.doesNotMatch(error.message, /secret/);
+      return true;
+    },
+  );
+});
+
+test("closes the plugin host before invoking plugin close", async () => {
+  const events = [];
+  const runtime = await loadPlugin("relay", {
+    configPath: "/tmp/relay.json",
+    readFile: async () => JSON.stringify(validConfig()),
+    importModule: async () => ({
+      default: () => ({
+        apiVersion: 1,
+        checkModel: async () => true,
+        close() {
+          events.push("plugin");
+        },
+      }),
+    }),
+    host: {
+      close() {
+        events.push("host");
+      },
+      logger: { info() {}, warn() {}, error() {} },
+    },
+  });
+
+  await runtime.close();
+
+  assert.deepEqual(events, ["host", "plugin"]);
+});
+
 test("assembles a normalized plugin runtime", async () => {
   const runtime = await loadPlugin("relay", {
     configPath: "/tmp/relay.json",

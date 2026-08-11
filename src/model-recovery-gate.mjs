@@ -13,6 +13,7 @@ export class ModelRecoveryGate {
   constructor({
     checkModel,
     intervalMs,
+    timeoutMs = 10_000,
     schedule = setTimeout,
     cancel = clearTimeout,
     logger = console,
@@ -21,8 +22,12 @@ export class ModelRecoveryGate {
     if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
       throw new Error("intervalMs must be a positive number");
     }
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("timeoutMs must be a positive number");
+    }
     this.checkModel = checkModel;
     this.intervalMs = intervalMs;
+    this.timeoutMs = timeoutMs;
     this.schedule = schedule;
     this.cancel = cancel;
     this.logger = logger;
@@ -83,7 +88,18 @@ export class ModelRecoveryGate {
     const request = { cycle, controller };
     this.#activeRequest = request;
     try {
-      const sample = await this.checkModel({ ...this.#context, signal: controller.signal });
+      const signal = AbortSignal.any([
+        controller.signal,
+        AbortSignal.timeout(this.timeoutMs),
+      ]);
+      const aborted = new Promise((_, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      const sample = await Promise.race([
+        this.checkModel({ ...this.#context, signal }),
+        aborted,
+      ]);
       if (this.#closed || cycle !== this.#cycle || this.#phase !== "confirming") return;
       if (typeof sample === "boolean") this.#recordSample(sample);
       else this.#recordUnknown();

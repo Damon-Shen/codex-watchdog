@@ -350,6 +350,43 @@ test("manual pause during model probing prevents recovery RPC", async () => {
   assert.deepEqual(requests, []);
 });
 
+test("does not continue a failed thread when the final goal lookup is paused", async () => {
+  const { controller, timers, requests } = createHarness({
+    goalStatus: "paused",
+    recoveryGate: immediateRecoveryGate([]),
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+
+  await timers[0].callback();
+
+  assert.deepEqual(requests, [
+    { method: "thread/goal/get", params: { threadId: "thread-1" } },
+  ]);
+});
+
+test("does not interrupt a retrying turn when the final goal lookup is paused", async () => {
+  const { controller, timers, requests } = createHarness({
+    goalStatus: "paused",
+    interruptAfterMs: 5,
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(retrying503());
+
+  await timers[0].callback();
+
+  assert.deepEqual(requests, [
+    { method: "thread/goal/get", params: { threadId: "thread-1" } },
+  ]);
+});
+
 test("retrying 429 with insufficient balances performs no Codex RPC", async () => {
   const gateCalls = [];
   const notification = terminal429("429 insufficient_quota: quota exhausted");
@@ -370,6 +407,37 @@ test("retrying 429 with insufficient balances performs no Codex RPC", async () =
 
   assert.deepEqual(requests, []);
   assert.deepEqual(gateCalls, []);
+});
+
+test("starts retrying 429 balance checks before turn progress can cancel recovery", async () => {
+  const balance = deferred();
+  let balanceSignal;
+  let balanceCalls = 0;
+  const notification = terminal429();
+  notification.params.willRetry = true;
+  const { controller, requests } = createHarness({
+    goalStatus: "active",
+    recoveryGate: immediateRecoveryGate([]),
+    checkBalances: async ({ signal }) => {
+      balanceCalls += 1;
+      balanceSignal = signal;
+      return balance.promise;
+    },
+    interruptAfterMs: 5,
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+
+  controller.handleNotification(notification);
+
+  assert.equal(balanceCalls, 1);
+  controller.handleNotification(completedItem());
+  assert.equal(balanceSignal.aborted, true);
+  balance.resolve("available");
+  await Promise.resolve();
+  assert.deepEqual(requests, []);
 });
 
 test("continues a failed ordinary thread after plugin-confirmed recovery", async () => {
@@ -500,6 +568,63 @@ test("a newer thread recovery supersedes the old gate owner", async () => {
     requests.filter(({ method }) => method === "thread/goal/set"),
     [{ method: "thread/goal/set", params: { threadId: "thread-2", status: "active" } }],
   );
+});
+
+test("a newer 429 recovery cancels an older in-flight balance query", async () => {
+  const oldBalance = deferred();
+  const newBalance = deferred();
+  const balanceSignals = new Map();
+  const gateEvents = [];
+  let currentRecovery;
+  const recoveryGate = {
+    beginRecoveryCheck({ error }) {
+      currentRecovery = deferred();
+      gateEvents.push(`begin:${error.message}`);
+    },
+    waitForRecovery() {
+      return currentRecovery.promise;
+    },
+    cancelRecoveryCheck() {
+      gateEvents.push("cancel");
+      currentRecovery?.reject(new Error("cancelled"));
+    },
+  };
+  const { controller, timers, goals } = createHarness({
+    recoveryGate,
+    checkBalances: ({ error, signal }) => {
+      balanceSignals.set(error.message, signal);
+      return error.message === "old" ? oldBalance.promise : newBalance.promise;
+    },
+  });
+  controller.handleNotification(terminal429("old"));
+  controller.handleNotification(blockedGoal());
+  const oldAttempt = timers[0].callback();
+  await Promise.resolve();
+
+  goals.set("thread-2", { status: "blocked" });
+  const newError = terminal429("new");
+  newError.params.threadId = "thread-2";
+  newError.params.turnId = "turn-2";
+  const newBlocked = blockedGoal();
+  newBlocked.params.threadId = "thread-2";
+  newBlocked.params.turnId = "turn-2";
+  controller.handleNotification(newError);
+  controller.handleNotification(newBlocked);
+  const newAttempt = timers[1].callback();
+  await Promise.resolve();
+
+  assert.equal(balanceSignals.get("old").aborted, true);
+  newBalance.resolve("available");
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(gateEvents, ["cancel", "begin:new"]);
+
+  oldBalance.resolve("available");
+  await Promise.resolve();
+  assert.deepEqual(gateEvents, ["cancel", "begin:new"]);
+
+  currentRecovery.resolve("confirmed-healthy");
+  await Promise.all([oldAttempt, newAttempt]);
 });
 
 test("stops ordinary goal recovery after a permanent goal lookup failure", async () => {
