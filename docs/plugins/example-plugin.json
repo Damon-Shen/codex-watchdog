@@ -1,0 +1,27 @@
+{
+  "apiVersion": 1,
+  "module": "./example-plugin.mjs",
+  "stack": "custom",
+  "baseUrl": "https://relay.example.com",
+  "apiKeys": [
+    {
+      "id": "subscription-a",
+      "value": "replace-with-api-key-a"
+    },
+    {
+      "id": "subscription-b",
+      "value": "replace-with-api-key-b"
+    }
+  ],
+  "model": "gpt-5.6-sol",
+  "probeIntervalMs": 30000,
+  "requestTimeoutMs": 4000,
+  "balancePolicy": {
+    "mode": "any",
+    "minimum": 1
+  },
+  "options": {
+    "statusPath": "/custom/model-status",
+    "balancePath": "/custom/account-balance"
+  }
+}

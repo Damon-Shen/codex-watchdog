@@ -15,8 +15,9 @@ Codex Goal Watchdog 是一个本地启动器，用来降低 Codex `/goal` 因短
 - 重试长时间没有恢复时，中断该 turn 一次，并在确认 goal 状态后继续运行。
 - 终态瞬时错误已经把 goal 置为 `blocked` 时，按退避时间重新激活同一个 goal。
 - 上下文窗口耗尽时，先压缩原 thread，再恢复同一个 goal。
+- 可通过每站点一个插件查询多个订阅余额，并按站点自定义模型测活。
 
-它不会绕过人工暂停、认证失败、用量限制、token budget、额度不足或已经完成的 goal。
+它不会绕过人工暂停、认证失败、明确的余额不足、token budget 或已经完成的 goal。
 
 ## 环境要求
 
@@ -77,6 +78,15 @@ codex-watchdog resume
 codex-watchdog resume --all
 ```
 
+使用中转站插件时，只增加一个 watchdog 参数；同名 JSON 配置会从用户配置目录自动加载：
+
+```bash
+codex-watchdog --plugin relay-name
+```
+
+插件安装、配置格式和开发接口见 [中转站插件指南](docs/plugins/README.md)。未传
+`--plugin` 时不加载插件，保持原有恢复行为。
+
 不要手动传入 `--remote`。代理地址由 watchdog 创建，额外的 `--remote` 会绕过恢复链，
 因此启动器会直接拒绝。
 
@@ -108,6 +118,8 @@ Codex TUI -> watchdog WebSocket proxy -> Codex app-server -> provider
 - `turn/interrupt`：仍在重试且超过宽限期时，对同一 turn 最多发送一次。
 - `thread/compact/start`：上下文耗尽时压缩原 thread。
 - `thread/goal/set`：turn 结束或压缩完成后，把可恢复的 goal 设回 `active`。
+- `turn/start`：没有 goal 的普通 thread 在模型恢复后发送谨慎的继续提示。
+- `turn/steer`：子代理不能直接接收输入时，把恢复提示路由给正在运行的父 thread。
 
 如果同一 turn 又出现 `item/*` 进展，待执行的中断会被取消。watchdog 发起中断后，单独
 收到 `active` 状态不足以证明 Codex 已经继续；只有新的 turn 真正开始，才会取消待执行
@@ -124,6 +136,9 @@ app-server 的错误信息，分享前仍应检查是否带有项目路径或其
 watchdog 只监听 `127.0.0.1`，不提供远程服务，也不接管 Codex 的认证配置。它会主动
 中断满足条件的 turn；如果该 turn 已经执行过有副作用的工具操作，后续恢复可能再次执行
 相关步骤。无人值守运行前，应确保任务本身可以安全重试。
+
+插件是受信任的进程内 Node.js 代码，不是沙箱。安装插件等同于运行对应 npm 包或本地
+脚本；插件配置还包含 API key，应限制文件权限并避免提交到项目仓库。
 
 ## 验证
 
@@ -151,6 +166,7 @@ bin/        Windows 启动脚本
 src/        启动器、代理、恢复控制器和错误分类
 test/       单元测试、代理集成测试和 live smoke test
 docs/adr/   架构决策记录
+docs/plugins/ 插件使用说明与完整示例
 ```
 
 ## 许可证
