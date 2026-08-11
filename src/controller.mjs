@@ -533,6 +533,7 @@ export class GoalWatchdogController {
     const pluginRecovery = pending.pluginRecoveryPromise ??
       this.#waitForPluginRecovery(threadId, turnId, state, pending);
     if (!await pluginRecovery) return;
+    this.#releasePluginRecovery(pending);
 
     try {
       const response = await this.sendRequest("thread/goal/get", { threadId });
@@ -622,6 +623,7 @@ export class GoalWatchdogController {
     let turnGeneration = null;
 
     if (!await this.#waitForPluginRecovery(threadId, turnId, state, pending)) return;
+    this.#releasePluginRecovery(pending);
 
     try {
       const response = await this.sendRequest("thread/goal/get", { threadId });
@@ -776,7 +778,6 @@ export class GoalWatchdogController {
         balanceStatus,
       });
       await this.recoveryGate.waitForRecovery();
-      this.#releasePluginRecovery(pending);
       if (!this.#isCurrentPending(threadId, state, pending)) return false;
       if (pending.failure) {
         pending.failure.pluginConfirmed = true;

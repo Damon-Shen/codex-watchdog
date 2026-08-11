@@ -627,6 +627,43 @@ test("a newer 429 recovery cancels an older in-flight balance query", async () =
   await Promise.all([oldAttempt, newAttempt]);
 });
 
+test("a newer recovery cancels a confirmed retrying 429 before its interrupt delay", async () => {
+  const notification = terminal429("old");
+  notification.params.willRetry = true;
+  const { controller, timers, goals, requests } = createHarness({
+    goalStatus: "active",
+    recoveryGate: immediateRecoveryGate([]),
+    checkBalances: async () => "available",
+    interruptAfterMs: 5,
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(notification);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  goals.set("thread-2", { status: "blocked" });
+  const newError = terminal503();
+  newError.params.threadId = "thread-2";
+  newError.params.turnId = "turn-2";
+  const newBlocked = blockedGoal();
+  newBlocked.params.threadId = "thread-2";
+  newBlocked.params.turnId = "turn-2";
+  controller.handleNotification(newError);
+  controller.handleNotification(newBlocked);
+  await timers[1].callback();
+
+  assert.equal(timers[0].cancelled, true);
+  await timers[0].callback();
+  assert.equal(
+    requests.some(({ method, params }) =>
+      method === "turn/interrupt" && params.threadId === "thread-1"),
+    false,
+  );
+});
+
 test("stops ordinary goal recovery after a permanent goal lookup failure", async () => {
   const error = new Error("401 unauthorized");
   error.code = 401;

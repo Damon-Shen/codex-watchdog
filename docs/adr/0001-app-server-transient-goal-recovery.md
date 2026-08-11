@@ -68,7 +68,7 @@ watchdog 在 Codex TUI 和 app-server 之间运行本地 WebSocket 代理，原�
 
 ## Amendment - 2026-08-11 - 中转站恢复改为命名插件
 
-- Evidence: 122/122 项单元与集成测试通过，静态检查退出 0，安装包 CLI 正确转发 cwd 与参数，live app-server 的 WebSocket 初始化、turn/interrupt 和 compact smoke 均通过
+- Evidence: 123/123 项单元与集成测试通过，静态检查退出 0，安装包 CLI 正确转发 cwd 与参数，live app-server 的 WebSocket 初始化、turn/interrupt 和 compact smoke 均通过
 - Evidence: 本地 JSON/ESM 插件代理集成测试实际执行余额检查、`false -> true` 模型恢复确认和 goal 恢复，并验证日志中的 API key 已脱敏
 - Evidence: 最终审查回归覆盖了状态复核时的人工暂停、跨 thread 余额查询抢占、retrying 429 立即查余额、模型脚本核心超时、关闭顺序和插件生命周期错误脱敏
 - Consequence: `--plugin <name>` 从用户配置目录加载一个受信任的站点插件；sub2api/newapi 余额查询内置，特殊站点可覆盖余额与模型测活
