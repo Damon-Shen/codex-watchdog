@@ -8,11 +8,13 @@ import {
   allocateDistinctTcpPorts,
   allocateTcpPort,
   ensureWorkingDirectoryArg,
+  extractWatchdogArgs,
   parseNonNegativeMilliseconds,
   resolveCodexEntrypoint,
   validateForwardedArgs,
   waitForHttpReady,
 } from "./launcher-support.mjs";
+import { loadPlugin } from "./plugin-loader.mjs";
 import { createWatchdogProxy } from "./proxy.mjs";
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -71,6 +73,7 @@ async function main() {
   let appServer;
   let tui;
   let proxy;
+  let pluginRuntime;
   let requestedSignal = null;
   let resolveSignal;
   const signalPromise = new Promise((resolve) => { resolveSignal = resolve; });
@@ -88,6 +91,12 @@ async function main() {
   }
 
   try {
+    const {
+      pluginName,
+      forwardedArgs,
+    } = extractWatchdogArgs(process.argv.slice(2));
+    validateForwardedArgs(forwardedArgs);
+    if (pluginName) pluginRuntime = await loadPlugin(pluginName, { logger });
     const codexEntrypoint = resolveCodexEntrypoint();
     const delaysMs = parseDelays(process.env.CODEX_WATCHDOG_DELAYS_MS);
     const interruptAfterMs = parseNonNegativeMilliseconds(
@@ -95,8 +104,6 @@ async function main() {
       DEFAULT_INTERRUPT_AFTER_MS,
       "CODEX_WATCHDOG_INTERRUPT_AFTER_MS",
     );
-    const forwardedArgs = process.argv.slice(2);
-    validateForwardedArgs(forwardedArgs);
     const launchCwd = process.cwd();
     const tuiArgs = ensureWorkingDirectoryArg(forwardedArgs, launchCwd);
     const [appServerPort, proxyPort] = await allocateDistinctTcpPorts(
@@ -125,6 +132,8 @@ async function main() {
       upstreamUrl: appServerUrl,
       delaysMs,
       interruptAfterMs,
+      recoveryGate: pluginRuntime?.recoveryGate ?? null,
+      checkBalances: pluginRuntime?.checkBalances ?? null,
       logger,
     });
 
@@ -155,9 +164,26 @@ async function main() {
     }
   } finally {
     for (const [signal, handler] of signalHandlers) process.off(signal, handler);
-    if (proxy) await proxy.close();
-    await terminateChild(tui);
-    await terminateChild(appServer);
+    try {
+      if (proxy) await proxy.close();
+    } catch (error) {
+      logger.error(`Failed to close watchdog proxy: ${error.message}`);
+    }
+    try {
+      if (pluginRuntime) await pluginRuntime.close();
+    } catch (error) {
+      logger.error(`Failed to close plugin runtime: ${error.message}`);
+    }
+    try {
+      await terminateChild(tui);
+    } catch (error) {
+      logger.error(`Failed to terminate TUI: ${error.message}`);
+    }
+    try {
+      await terminateChild(appServer);
+    } catch (error) {
+      logger.error(`Failed to terminate app-server: ${error.message}`);
+    }
     closeSync(logger.fd);
   }
 }

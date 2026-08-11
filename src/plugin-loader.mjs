@@ -83,6 +83,7 @@ export async function loadPlugin(
     pathToFileURLImpl = (filePath) => pathToFileURL(filePath).href,
     importModule = (specifier) => import(specifier),
     host,
+    logger = console,
   } = {},
 ) {
   validatePluginName(name);
@@ -106,6 +107,7 @@ export async function loadPlugin(
 
   const pathApi = platform === "win32" ? path.win32 : path;
   let moduleSpecifier = config.module;
+  let ownedPluginHost = null;
   try {
     if (isLocalModule(moduleSpecifier, pathApi)) {
       moduleSpecifier = pathApi.resolve(pathApi.dirname(configPath), moduleSpecifier);
@@ -118,7 +120,8 @@ export async function loadPlugin(
     if (typeof loaded?.default !== "function") {
       throw new Error(`Plugin ${name} module must default-export a factory`);
     }
-    const pluginHost = host ?? createPluginHost({ config });
+    const pluginHost = host ?? createPluginHost({ config, logger });
+    if (!host) ownedPluginHost = pluginHost;
     const plugin = await loaded.default({ config, host: pluginHost });
     if (!plugin || typeof plugin !== "object") {
       throw new Error(`Plugin ${name} factory must return a plugin object`);
@@ -160,11 +163,15 @@ export async function loadPlugin(
       recoveryGate,
       async close() {
         recoveryGate.close();
-        await plugin.close?.();
-        pluginHost.close?.();
+        try {
+          await plugin.close?.();
+        } finally {
+          pluginHost.close?.();
+        }
       },
     };
   } catch (error) {
+    ownedPluginHost?.close?.();
     if (error instanceof Error && error.message.startsWith("Plugin ")) throw error;
     throw new Error(`Could not load plugin ${name}: ${error.message}`);
   }
