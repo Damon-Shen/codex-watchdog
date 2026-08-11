@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import WebSocket, { WebSocketServer } from "ws";
 
+import { loadPlugin } from "../src/plugin-loader.mjs";
 import { createWatchdogProxy } from "../src/proxy.mjs";
 
 function waitForOpen(socket) {
@@ -561,4 +565,110 @@ test("passes relay recovery dependencies through the proxy controller", async (t
   );
   assert.equal(balanceCalls.length, 1);
   assert.equal(gateCalls.length, 1);
+});
+
+test("recovers through a loaded local plugin runtime", async (t) => {
+  const pluginRoot = await mkdtemp(path.join(os.tmpdir(), "watchdog-proxy-plugin-"));
+  const configPath = path.join(pluginRoot, "plugins", "relay.json");
+  const pluginLogs = [];
+  await mkdir(path.dirname(configPath), { recursive: true });
+  await writeFile(path.join(path.dirname(configPath), "relay.mjs"), `
+export default ({ config, host }) => {
+  let modelChecks = 0;
+  return {
+    apiVersion: 1,
+    checkModel: async () => {
+      modelChecks += 1;
+      host.logger.info(\`model check \${modelChecks} with \${config.apiKeys[0].value}\`);
+      return modelChecks > 1;
+    },
+    checkBalances: async () => {
+      host.logger.info(\`balance check with \${config.apiKeys[0].value}\`);
+      return [{ accountId: "primary", balance: 10 }];
+    },
+  };
+};
+`);
+  await writeFile(configPath, JSON.stringify({
+    apiVersion: 1,
+    module: "./relay.mjs",
+    stack: "custom",
+    baseUrl: "https://relay.example",
+    apiKeys: [{ id: "primary", value: "secret" }],
+    model: "gpt-test",
+    probeIntervalMs: 1,
+    requestTimeoutMs: 50,
+    balancePolicy: { mode: "any", minimum: 1 },
+  }));
+  const runtime = await loadPlugin("relay", {
+    configPath,
+    logger: {
+      info: (message) => pluginLogs.push(message),
+      warn: (message) => pluginLogs.push(message),
+      error: (message) => pluginLogs.push(message),
+    },
+  });
+  const upstream = await startMockAppServer();
+  const proxy = await createWatchdogProxy({
+    listenHost: "127.0.0.1",
+    listenPort: 0,
+    upstreamUrl: upstream.url,
+    delaysMs: [0],
+    checkBalances: runtime.checkBalances,
+    recoveryGate: runtime.recoveryGate,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const tui = new WebSocket(proxy.url);
+  t.after(async () => {
+    tui.terminate();
+    await proxy.close();
+    await runtime.close();
+    await upstream.close();
+    await rm(pluginRoot, { recursive: true, force: true });
+  });
+  await waitForOpen(tui);
+  const initialized = waitForMessage(tui, (message) => message.id === "runtime-init");
+  tui.send(JSON.stringify({
+    method: "initialize",
+    id: "runtime-init",
+    params: { clientInfo: { name: "test", title: "Test", version: "1" } },
+  }));
+  await initialized;
+
+  upstream.send({
+    method: "error",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      willRetry: false,
+      error: {
+        message: "429 Too Many Requests",
+        codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+        additionalDetails: null,
+      },
+    },
+  });
+  upstream.send({
+    method: "thread/goal/updated",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      goal: { threadId: "thread-1", status: "blocked" },
+    },
+  });
+
+  await waitForMessage(
+    tui,
+    (message) => message.method === "thread/goal/updated" && message.params.goal.status === "active",
+  );
+  assert.deepEqual(
+    upstream.received
+      .filter((message) => String(message.id ?? "").startsWith("goal-watchdog:"))
+      .map((message) => message.method),
+    ["thread/goal/get", "thread/goal/set"],
+  );
+  assert.match(pluginLogs.join("\n"), /model check 1/);
+  assert.match(pluginLogs.join("\n"), /model check 2/);
+  assert.match(pluginLogs.join("\n"), /\[REDACTED\]/);
+  assert.doesNotMatch(pluginLogs.join("\n"), /secret/);
 });

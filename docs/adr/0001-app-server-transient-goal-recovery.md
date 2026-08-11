@@ -65,3 +65,13 @@ watchdog 在 Codex TUI 和 app-server 之间运行本地 WebSocket 代理，原�
 - Evidence: 新增组合回归测试先稳定失败；调整顺序后 npm test 通过 63/63，npm run test:live 与 npm run check 均退出 0
 - Consequence: 明确的 insufficient_quota、quota exhausted 等永久错误优先于结构化 HTTP 429，不会触发自动恢复
 - Reason decision still stands: 同一 provider 通知可能同时携带 HTTP 状态和业务错误文本，永久额度语义比通用限流状态更具体
+
+## Amendment - 2026-08-11 - 中转站恢复改为命名插件
+
+- Evidence: 114/114 项单元与集成测试通过，静态检查退出 0，安装包 CLI 正确转发 cwd 与参数，live app-server 的 WebSocket 初始化、turn/interrupt 和 compact smoke 均通过
+- Evidence: 本地 JSON/ESM 插件代理集成测试实际执行余额检查、`false -> true` 模型恢复确认和 goal 恢复，并验证日志中的 API key 已脱敏
+- Consequence: `--plugin <name>` 从用户配置目录加载一个受信任的站点插件；sub2api/newapi 余额查询内置，特殊站点可覆盖余额与模型测活
+- Consequence: 插件模式下所有 HTTP 429 均先查询多账户余额，只有聚合结果 `insufficient` 停止；`available` 和 `unknown` 进入模型恢复确认，不维护连续 429 熔断
+- Consequence: 模型确认后仍由核心复核状态并恢复 goal、普通 thread 或可接收输入的父 thread；插件不能发送 Codex RPC
+- Consequence: live smoke 仍是无插件的真实 Codex app-server 协议测试；插件恢复链路使用 mock app-server，避免对真实中转站的余额和故障状态产生副作用
+- Reason decision still stands: app-server 代理继续独占恢复状态机和并发控制，插件只替换原先与单一中转站绑定的状态探针
