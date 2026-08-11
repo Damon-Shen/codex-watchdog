@@ -6,6 +6,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,6 +15,15 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+if (process.platform !== "win32") {
+  const sourceBin = path.join(repositoryRoot, "bin", "codex-watchdog.mjs");
+  assert.notEqual(
+    statSync(sourceBin).mode & 0o111,
+    0,
+    "bin/codex-watchdog.mjs must be executable for local global installs",
+  );
+}
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
