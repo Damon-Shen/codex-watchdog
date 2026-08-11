@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import createAiInputPlugin from "../plugins/aiinput.mjs";
+import { loadPlugin } from "../src/plugin-loader.mjs";
 
 function createHarness({ ok = true, status = 200, payload, jsonError } = {}) {
   const requests = [];
@@ -79,4 +82,21 @@ test("turns ambiguous ai.input.im responses into probe errors", async () => {
     });
     await assert.rejects(() => plugin.checkModel({}), pattern);
   }
+});
+
+test("ships a loadable multi-account Sub2API configuration", async () => {
+  const configUrl = new URL("../plugins/aiinput.example.json", import.meta.url);
+  const config = JSON.parse(await readFile(configUrl, "utf8"));
+  assert.equal(config.module, "./aiinput.mjs");
+  assert.equal(config.stack, "sub2api");
+  assert.equal(config.baseUrl, "https://ai.input.im");
+  assert.equal(config.apiKeys.length, 2);
+
+  const runtime = await loadPlugin("aiinput", {
+    configPath: fileURLToPath(configUrl),
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  assert.equal(runtime.plugin.id, "aiinput");
+  assert.equal(runtime.plugin.checkBalances, undefined);
+  await runtime.close();
 });

@@ -69,6 +69,35 @@ chmod 600 ~/.config/codex-watchdog/plugins/relay-name.json
 
 查询失败使用 `unknown`，不会被当成零余额。
 
+## ai.input.im
+
+仓库内的 `plugins/aiinput.mjs` 和 `plugins/aiinput.example.json` 可以直接复制到用户配置
+目录。POSIX 系统执行：
+
+```bash
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/codex-watchdog/plugins"
+mkdir -p "$config_dir"
+cp plugins/aiinput.mjs "$config_dir/aiinput.mjs"
+cp plugins/aiinput.example.json "$config_dir/aiinput.json"
+chmod 600 "$config_dir/aiinput.json"
+codex-watchdog --plugin aiinput
+```
+
+Windows PowerShell 执行：
+
+```powershell
+$configDir = Join-Path $env:APPDATA "codex-watchdog\plugins"
+New-Item -ItemType Directory -Force $configDir | Out-Null
+Copy-Item plugins\aiinput.mjs (Join-Path $configDir "aiinput.mjs")
+Copy-Item plugins\aiinput.example.json (Join-Path $configDir "aiinput.json")
+codex-watchdog --plugin aiinput
+```
+
+启动前编辑 `aiinput.json`：替换 `model`、每个 `apiKeys[].value`、账户 `id` 和
+`balancePolicy.minimum`；有更多订阅时可继续添加 key 记录。模型测活地址固定为
+`https://status.input.im/api/status`。余额由内置 Sub2API 适配器为每个配置的 API key
+分别请求一次 `https://ai.input.im/v1/usage`。
+
 ## 安装模块
 
 本地私有插件可将 `module` 写成 `./relay.mjs`，并把文件放在 JSON 旁边。npm 插件可以安装
