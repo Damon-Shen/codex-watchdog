@@ -17,18 +17,26 @@ function createHarness({
   goalStatus = "blocked",
   goalGetResponses = [],
   goalSetResponses = [],
+  turnStartResponses = [],
+  turnSteerResponses = [],
   compactResponses = [],
   interruptAfterMs = 120_000,
+  recoveryGate = null,
+  checkBalances = null,
 } = {}) {
   const requests = [];
   const timers = [];
   const cancelled = [];
   const logs = [];
-  const goals = new Map([["thread-1", { status: goalStatus }]]);
+  const goals = goalStatus === null
+    ? new Map()
+    : new Map([["thread-1", { status: goalStatus }]]);
 
   const controller = new GoalWatchdogController({
     delaysMs: [30_000, 60_000, 120_000],
     interruptAfterMs,
+    recoveryGate,
+    checkBalances,
     sendRequest: async (method, params) => {
       requests.push({ method, params });
       if (method === "thread/goal/get") {
@@ -50,6 +58,22 @@ function createHarness({
       }
       if (method === "turn/interrupt") {
         return { turnId: params.turnId, status: "interrupting" };
+      }
+      if (method === "turn/start") {
+        if (turnStartResponses.length > 0) {
+          const response = turnStartResponses.shift();
+          if (response instanceof Error) throw response;
+          return response;
+        }
+        return { turn: { id: "turn-recovery", status: "inProgress" } };
+      }
+      if (method === "turn/steer") {
+        if (turnSteerResponses.length > 0) {
+          const response = turnSteerResponses.shift();
+          if (response instanceof Error) throw response;
+          return response;
+        }
+        return { turnId: params.expectedTurnId };
       }
       if (method === "thread/compact/start") {
         if (compactResponses.length === 0) return {};
@@ -98,6 +122,70 @@ function retrying503() {
   const notification = terminal503();
   notification.params.willRetry = true;
   return notification;
+}
+
+function terminal429(message = "429 Too Many Requests") {
+  return {
+    method: "error",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      willRetry: false,
+      error: {
+        message,
+        codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+        additionalDetails: null,
+      },
+    },
+  };
+}
+
+function serverOverloaded() {
+  return {
+    method: "error",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      willRetry: false,
+      error: {
+        message: "model is temporarily overloaded",
+        codexErrorInfo: "serverOverloaded",
+        additionalDetails: null,
+      },
+    },
+  };
+}
+
+function failedTurn(threadId = "thread-1", turnId = "turn-1") {
+  return {
+    method: "turn/completed",
+    params: {
+      threadId,
+      turn: {
+        id: turnId,
+        status: "failed",
+        error: { message: "service unavailable" },
+      },
+    },
+  };
+}
+
+function threadStarted(id, { parentThreadId = null, canAcceptDirectInput = true } = {}) {
+  return {
+    method: "thread/started",
+    params: { thread: { id, parentThreadId, canAcceptDirectInput } },
+  };
+}
+
+function immediateRecoveryGate(calls) {
+  return {
+    beginRecoveryCheck(context) {
+      calls.push(context);
+    },
+    async waitForRecovery() {
+      return "confirmed-healthy";
+    },
+  };
 }
 
 function blockedGoal(status = "blocked") {
@@ -167,6 +255,251 @@ test("checks the current goal before resuming", async () => {
     },
   ]);
   assert.equal(goals.get("thread-1").status, "active");
+});
+
+test("429 with insufficient balances stops before model probing or Codex RPC", async () => {
+  const gateCalls = [];
+  const balanceCalls = [];
+  const { controller, timers, requests } = createHarness({
+    recoveryGate: immediateRecoveryGate(gateCalls),
+    checkBalances: async (context) => {
+      balanceCalls.push(context);
+      return "insufficient";
+    },
+  });
+  controller.handleNotification(terminal429("429 insufficient_quota: quota exhausted"));
+  controller.handleNotification(blockedGoal());
+
+  await timers[0].callback();
+
+  assert.equal(balanceCalls.length, 1);
+  assert.equal(balanceCalls[0].error.message, "429 insufficient_quota: quota exhausted");
+  assert.equal(balanceCalls[0].signal instanceof AbortSignal, true);
+  assert.deepEqual(gateCalls, []);
+  assert.deepEqual(requests, []);
+});
+
+test("429 with available or unknown balances enters the model gate before recovery", async () => {
+  for (const balanceStatus of ["available", "unknown"]) {
+    const gateCalls = [];
+    const { controller, timers, requests } = createHarness({
+      recoveryGate: immediateRecoveryGate(gateCalls),
+      checkBalances: async () => balanceStatus,
+    });
+    controller.handleNotification(terminal429());
+    controller.handleNotification(blockedGoal());
+
+    await timers[0].callback();
+
+    assert.equal(gateCalls.length, 1);
+    assert.equal(gateCalls[0].balanceStatus, balanceStatus);
+    assert.equal(gateCalls[0].error.message, "429 Too Many Requests");
+    assert.deepEqual(requests.map(({ method }) => method), [
+      "thread/goal/get",
+      "thread/goal/set",
+    ]);
+  }
+});
+
+test("non-429 transient and model-capacity errors skip balances and enter the model gate", async () => {
+  for (const notification of [terminal503(), serverOverloaded()]) {
+    const balanceCalls = [];
+    const gateCalls = [];
+    const { controller, timers } = createHarness({
+      recoveryGate: immediateRecoveryGate(gateCalls),
+      checkBalances: async (context) => {
+        balanceCalls.push(context);
+        return "available";
+      },
+    });
+    controller.handleNotification(notification);
+    controller.handleNotification(blockedGoal());
+
+    await timers[0].callback();
+
+    assert.deepEqual(balanceCalls, []);
+    assert.equal(gateCalls.length, 1);
+    assert.equal(gateCalls[0].balanceStatus, null);
+  }
+});
+
+test("manual pause during model probing prevents recovery RPC", async () => {
+  const recovery = deferred();
+  const gateCalls = [];
+  const { controller, timers, requests } = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck(context) {
+        gateCalls.push(context);
+      },
+      waitForRecovery() {
+        return recovery.promise;
+      },
+    },
+    checkBalances: async () => "available",
+  });
+  controller.handleNotification(terminal429());
+  controller.handleNotification(blockedGoal());
+
+  const attempt = timers[0].callback();
+  await Promise.resolve();
+  controller.handleNotification(blockedGoal("paused"));
+  recovery.resolve("confirmed-healthy");
+  await attempt;
+
+  assert.equal(gateCalls.length, 1);
+  assert.deepEqual(requests, []);
+});
+
+test("retrying 429 with insufficient balances performs no Codex RPC", async () => {
+  const gateCalls = [];
+  const notification = terminal429("429 insufficient_quota: quota exhausted");
+  notification.params.willRetry = true;
+  const { controller, timers, requests } = createHarness({
+    goalStatus: "active",
+    recoveryGate: immediateRecoveryGate(gateCalls),
+    checkBalances: async () => "insufficient",
+    interruptAfterMs: 5,
+  });
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "turn-1" } },
+  });
+  controller.handleNotification(notification);
+
+  await timers[0].callback();
+
+  assert.deepEqual(requests, []);
+  assert.deepEqual(gateCalls, []);
+});
+
+test("continues a failed ordinary thread after plugin-confirmed recovery", async () => {
+  const gateCalls = [];
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: immediateRecoveryGate(gateCalls),
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+
+  await timers[0].callback();
+
+  assert.equal(gateCalls.length, 1);
+  assert.equal(requests.at(-1).method, "turn/start");
+  assert.equal(requests.at(-1).params.threadId, "thread-1");
+  assert.match(requests.at(-1).params.input[0].text, /继续完成/);
+});
+
+test("routes failed sub-agent recovery to its active direct-input parent", async () => {
+  const gateCalls = [];
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: immediateRecoveryGate(gateCalls),
+  });
+  controller.handleNotification(threadStarted("thread-parent"));
+  controller.handleNotification(threadStarted("thread-1", {
+    parentThreadId: "thread-parent",
+    canAcceptDirectInput: false,
+  }));
+  controller.handleNotification({
+    method: "turn/started",
+    params: { threadId: "thread-parent", turn: { id: "turn-parent" } },
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+
+  await timers[0].callback();
+
+  assert.equal(requests.at(-1).method, "turn/steer");
+  assert.equal(requests.at(-1).params.threadId, "thread-parent");
+  assert.equal(requests.at(-1).params.expectedTurnId, "turn-parent");
+  assert.match(requests.at(-1).params.input[0].text, /子代理线程 thread-1/);
+});
+
+test("routes failed sub-agent recovery to its idle direct-input parent", async () => {
+  const { controller, timers, requests } = createHarness({
+    goalStatus: null,
+    recoveryGate: immediateRecoveryGate([]),
+  });
+  controller.handleNotification(threadStarted("thread-parent"));
+  controller.handleNotification(threadStarted("thread-1", {
+    parentThreadId: "thread-parent",
+    canAcceptDirectInput: false,
+  }));
+  controller.handleNotification(terminal503());
+  controller.handleNotification(failedTurn());
+
+  await timers[0].callback();
+
+  assert.equal(requests.at(-1).method, "turn/start");
+  assert.equal(requests.at(-1).params.threadId, "thread-parent");
+});
+
+test("controller close cancels the active plugin recovery cycle", async () => {
+  const recovery = deferred();
+  let cancellations = 0;
+  const { controller, timers, requests } = createHarness({
+    recoveryGate: {
+      beginRecoveryCheck() {},
+      waitForRecovery: () => recovery.promise,
+      cancelRecoveryCheck() {
+        cancellations += 1;
+        recovery.reject(new Error("cancelled"));
+      },
+    },
+  });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(blockedGoal());
+  const attempt = timers[0].callback();
+  await Promise.resolve();
+
+  controller.close();
+  await attempt;
+
+  assert.equal(cancellations, 1);
+  assert.deepEqual(requests, []);
+});
+
+test("a newer thread recovery supersedes the old gate owner", async () => {
+  const cycles = [];
+  let current;
+  const recoveryGate = {
+    beginRecoveryCheck(context) {
+      current = deferred();
+      cycles.push({ context, deferred: current });
+    },
+    waitForRecovery() {
+      return current.promise;
+    },
+    cancelRecoveryCheck() {
+      current?.reject(new Error("cancelled"));
+    },
+  };
+  const { controller, timers, requests, goals } = createHarness({ recoveryGate });
+  controller.handleNotification(terminal503());
+  controller.handleNotification(blockedGoal());
+  const firstRecovery = timers[0].callback();
+  await Promise.resolve();
+
+  goals.set("thread-2", { status: "blocked" });
+  const secondError = terminal503();
+  secondError.params.threadId = "thread-2";
+  secondError.params.turnId = "turn-2";
+  const secondBlocked = blockedGoal();
+  secondBlocked.params.threadId = "thread-2";
+  secondBlocked.params.turnId = "turn-2";
+  controller.handleNotification(secondError);
+  controller.handleNotification(secondBlocked);
+  const secondRecovery = timers[1].callback();
+  await Promise.resolve();
+
+  cycles[1].deferred.resolve("confirmed-healthy");
+  await Promise.all([firstRecovery, secondRecovery]);
+
+  assert.equal(cycles.length, 2);
+  assert.deepEqual(
+    requests.filter(({ method }) => method === "thread/goal/set"),
+    [{ method: "thread/goal/set", params: { threadId: "thread-2", status: "active" } }],
+  );
 });
 
 test("stops ordinary goal recovery after a permanent goal lookup failure", async () => {

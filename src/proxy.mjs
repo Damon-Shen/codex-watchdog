@@ -28,6 +28,8 @@ export async function createWatchdogProxy({
   upstreamUrl,
   delaysMs,
   interruptAfterMs,
+  recoveryGate = null,
+  checkBalances = null,
   logger = console,
 }) {
   if (!upstreamUrl) throw new Error("upstreamUrl is required");
@@ -66,6 +68,8 @@ export async function createWatchdogProxy({
       sendRequest: (method, params) => rpc.request(method, params),
       delaysMs,
       interruptAfterMs,
+      recoveryGate,
+      checkBalances,
       logger,
     });
 

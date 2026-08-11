@@ -47,6 +47,18 @@ export class ModelRecoveryGate {
     return new Promise((resolve, reject) => this.#waiters.add({ resolve, reject }));
   }
 
+  cancelRecoveryCheck(reason = new Error("Model recovery cycle was cancelled")) {
+    if (this.#closed) return;
+    this.#cycle += 1;
+    this.#phase = "idle";
+    this.#outcome = null;
+    this.#cancelTimer();
+    this.#activeRequest?.controller.abort(reason);
+    this.#activeRequest = null;
+    for (const waiter of this.#waiters) waiter.reject(reason);
+    this.#waiters.clear();
+  }
+
   close() {
     if (this.#closed) return;
     this.#closed = true;

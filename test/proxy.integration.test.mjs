@@ -39,6 +39,17 @@ function waitForMessage(socket, predicate, timeoutMs = 2_000) {
   });
 }
 
+function immediateRecoveryGate(calls) {
+  return {
+    beginRecoveryCheck(context) {
+      calls.push(context);
+    },
+    async waitForRecovery() {
+      return "confirmed-healthy";
+    },
+  };
+}
+
 async function startMockAppServer() {
   const httpServer = createServer();
   const wss = new WebSocketServer({ server: httpServer });
@@ -489,4 +500,65 @@ test("waits for compaction completion before resuming through the proxy", async 
     "thread/goal/get",
     "thread/goal/set",
   ]);
+});
+
+test("passes relay recovery dependencies through the proxy controller", async (t) => {
+  const upstream = await startMockAppServer();
+  const balanceCalls = [];
+  const gateCalls = [];
+  const proxy = await createWatchdogProxy({
+    listenHost: "127.0.0.1",
+    listenPort: 0,
+    upstreamUrl: upstream.url,
+    delaysMs: [0],
+    checkBalances: async (context) => {
+      balanceCalls.push(context);
+      return "available";
+    },
+    recoveryGate: immediateRecoveryGate(gateCalls),
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const tui = new WebSocket(proxy.url);
+  t.after(async () => {
+    tui.terminate();
+    await proxy.close();
+    await upstream.close();
+  });
+  await waitForOpen(tui);
+  const initialized = waitForMessage(tui, (message) => message.id === "plugin-init");
+  tui.send(JSON.stringify({
+    method: "initialize",
+    id: "plugin-init",
+    params: { clientInfo: { name: "test", title: "Test", version: "1" } },
+  }));
+  await initialized;
+
+  upstream.send({
+    method: "error",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      willRetry: false,
+      error: {
+        message: "429 Too Many Requests",
+        codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+        additionalDetails: null,
+      },
+    },
+  });
+  upstream.send({
+    method: "thread/goal/updated",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      goal: { threadId: "thread-1", status: "blocked" },
+    },
+  });
+
+  await waitForMessage(
+    tui,
+    (message) => message.method === "thread/goal/updated" && message.params.goal.status === "active",
+  );
+  assert.equal(balanceCalls.length, 1);
+  assert.equal(gateCalls.length, 1);
 });

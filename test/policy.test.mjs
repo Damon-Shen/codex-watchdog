@@ -73,7 +73,7 @@ test("does not retry structured 429 when the provider reports exhausted quota", 
     assert.deepEqual(classifyTerminalError(notification), {
       transient: false,
       reason: "permanent-error-message",
-      statusCode: null,
+      statusCode: 429,
     });
   }
 });

@@ -199,6 +199,33 @@ test("close cancels timers, aborts requests, and rejects waiters", async () => {
   pending.resolve(true);
 });
 
+test("cancels one recovery cycle without closing the reusable gate", async () => {
+  const pending = deferred();
+  let signal;
+  const scheduler = createScheduler();
+  const gate = new ModelRecoveryGate({
+    intervalMs: 10,
+    schedule: scheduler.schedule,
+    cancel: scheduler.cancel,
+    checkModel: ({ signal: requestSignal }) => {
+      signal = requestSignal;
+      return pending.promise;
+    },
+  });
+  gate.beginRecoveryCheck();
+  const cancelled = gate.waitForRecovery();
+  cancelled.catch(() => {});
+  await flush();
+
+  gate.cancelRecoveryCheck();
+
+  assert.equal(signal.aborted, true);
+  await assert.rejects(cancelled, /cancelled/i);
+  pending.resolve(true);
+  gate.beginRecoveryCheck();
+  gate.close();
+});
+
 test("validates constructor arguments", () => {
   assert.throws(() => new ModelRecoveryGate({ intervalMs: 1 }), /checkModel/);
   assert.throws(() => new ModelRecoveryGate({ checkModel() {}, intervalMs: 0 }), /intervalMs/);

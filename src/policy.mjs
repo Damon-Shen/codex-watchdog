@@ -64,18 +64,20 @@ export function classifyTerminalError(notification) {
   if (/ran out of room in the model'?s context window|context window exceeded/i.test(message)) {
     return compactRecovery();
   }
+  const structured = structuredConnectionFailure(info);
+  const httpMatch = message.match(/(?:^|\D)(429|502|503|504)(?:\D|$)/);
+  const observedStatusCode = structured?.statusCode ??
+    (httpMatch ? Number(httpMatch[1]) : null);
   if (PERMANENT_MESSAGE_PATTERN.test(message)) {
-    return result(false, "permanent-error-message");
+    return result(false, "permanent-error-message", observedStatusCode);
   }
 
-  const structured = structuredConnectionFailure(info);
   if (structured) return markCodexRetry(structured, willRetry);
 
   if (info === "serverOverloaded") {
     return result(true, "server-overloaded", null, willRetry);
   }
 
-  const httpMatch = message.match(/(?:^|\D)(429|502|503|504)(?:\D|$)/);
   if (httpMatch) {
     const statusCode = Number(httpMatch[1]);
     return result(true, `http-${statusCode}`, statusCode, willRetry);
