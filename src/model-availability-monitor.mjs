@@ -1,4 +1,8 @@
-import { readModelStatus } from "./model-probe.mjs";
+function readModelStatus(payload, targetModel) {
+  if (!Array.isArray(payload?.services)) return null;
+  const service = payload.services.find((candidate) => candidate?.model === targetModel);
+  return typeof service?.last?.ok === "boolean" ? service.last.ok : null;
+}
 
 function positiveNumber(value, name) {
   if (!Number.isFinite(value) || value <= 0) {
