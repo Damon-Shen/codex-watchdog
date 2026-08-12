@@ -6,3 +6,12 @@ coverage/
 *.log
 *.tgz
 npm-debug.log*
+.spec-workflow/
+.playwright-mcp/
+CodexWatchdog.exe
+CodexWatchdog.previous-*.exe
+desktop-watchdog.config.bat
+desktop-watchdog.policy.json
+desktop-watchdog.projects.json
+desktop-watchdog.retry-rules.json
+desktop-watchdog.title-cache.json

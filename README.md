@@ -230,6 +230,72 @@ CODEX_WATCHDOG_INTERRUPT_AFTER_MS="10000" \
 codex-watchdog --plugin aiinput
 ```
 
+## Codex 桌面客户端 SSE 重试代理
+
+桌面客户端不要使用前面的 WebSocket/TUI 代理。`desktop-proxy` 是一条独立的本机 HTTP
+转发链路，适合放在 Codex 桌面客户端与现有 OpenAI Responses 网关之间：
+
+```text
+Codex Desktop -> http://127.0.0.1:3001/v1 -> http://127.0.0.1:3000/v1
+```
+
+启动命令：
+
+```bash
+codex-watchdog desktop-proxy
+```
+
+Windows 可以直接双击 `启动Codex桌面监听.bat`。首次使用时，将
+`desktop-watchdog.config.example.bat` 复制为 `desktop-watchdog.config.bat`，按需修改
+上游地址、模型状态接口和模型名称。脚本会从 `PATH` 自动查找 Node.js，并将代理放到后台
+运行；关闭状态窗口不会停止监听。
+
+也可以使用图形管理器：
+
+```text
+双击 构建CodexWatchdog桌面版.bat
+双击 启动CodexWatchdog桌面版.bat
+```
+
+管理器可以启动或停止代理、查看上游和模型状态、按项目选择受模型 gate 控制的对话、设置
+新对话默认策略、管理自动重试错误规则，并将最新日志显示在顶部。每个项目默认显示最近
+5 条对话，其余对话可展开查看。
+
+> 独立 EXE 不会接入 Codex Desktop 私有的 stdio app-server，也不会启动第二个
+> app-server。管理器从本地 SQLite 读取对话，并使用保存项目列表和可选标题缓存还原侧栏。
+> 因此对话 ID、工作目录和更新时间可以同步，但新生成的展示标题不保证与 Codex 左栏实时
+> 逐字一致。
+
+它不会轮询 Codex 对话，也不会启动第二个 app-server。正常请求只转发一次；仅在原始
+Responses 请求返回 429/5xx、连接异常，或者 SSE 的 `response.failed`/`error` 明确包含
+`server_overloaded`、容量不足、限流、临时服务不可用或流提前断开时重试。内置规则包括
+`Selected model is at capacity`、`stream disconnected before completion` 和
+`stream closed before response.completed`；规则可以在管理器中启用、停用或扩展。
+
+代理会在转发给桌面客户端前缓冲单次 Responses SSE。这样失败响应中的文字和工具调用
+不会先被桌面执行，重放原请求不会重复客户端工具副作用。缓冲超过 64 MiB 时会直接转发
+并关闭该次请求的自动重试，以避免无界内存增长。代价是每个模型响应会在完整结束后一次性
+显示，而不是逐 token 显示。
+
+可用环境变量：
+
+- `CODEX_DESKTOP_PROXY_HOST`：监听地址，默认 `127.0.0.1`。
+- `CODEX_DESKTOP_PROXY_PORT`：监听端口，默认 `3001`。
+- `CODEX_DESKTOP_PROXY_UPSTREAM`：上游 origin，默认 `http://127.0.0.1:3000`。
+- `CODEX_DESKTOP_PROXY_RETRY_DELAYS_MS`：错误后的重试等待毫秒，默认
+  `1000,3000,10000,30000,60000`。
+- `CODEX_DESKTOP_PROXY_MAX_REQUEST_BYTES`：最大请求体，默认 64 MiB。
+- `CODEX_DESKTOP_PROXY_MAX_RESPONSE_BYTES`：安全重试缓冲上限，默认 64 MiB。
+
+健康检查：`http://127.0.0.1:3001/healthz`。
+
+模型监控状态：`http://127.0.0.1:3001/statusz`。启用模型监控后，只有策略中标记为
+`monitor` 的对话会在模型离线时暂停请求；`bypass` 对话继续直通上游。模型恢复后代理发送
+原请求，不会批量启动历史对话，也不会创建额外 turn。
+
+这条链路本身不调用模型，因此正常监听不消耗 token。只有原始 Codex 请求和遇到可恢复
+故障后实际发出的重试请求会使用模型额度。
+
 ## 日志与安全边界
 
 - watchdog 只监听 `127.0.0.1`，不提供远程服务，也不接管 Codex 认证。
@@ -272,6 +338,8 @@ plugins/         仓库附带的站点插件与脱敏配置示例
 test/            单元测试、代理集成测试和 live smoke test
 docs/adr/        架构决策记录
 docs/plugins/    插件安装、配置与开发指南
+desktop-manager.cs                    Windows 图形管理器源码
+desktop-watchdog.config.example.bat   桌面代理配置模板
 ```
 
 ## 作者与鸣谢
