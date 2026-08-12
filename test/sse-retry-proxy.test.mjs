@@ -93,6 +93,28 @@ test("classifies the Codex premature stream disconnect message as recoverable", 
   });
 });
 
+test("classifies the upstream api_error temporarily unavailable message as recoverable", () => {
+  const body = Buffer.from(sse({
+    event: "error",
+    data: {
+      type: "error",
+      error: {
+        message: "Service temporarily unavailable",
+        type: "api_error",
+      },
+      detail: "after 3 attempts",
+    },
+  }));
+  assert.deepEqual(classifyBufferedResponse({
+    status: 200,
+    contentType: "text/event-stream",
+    body,
+  }), {
+    retryable: true,
+    reason: "SSE error",
+  });
+});
+
 test("retries an SSE stream that closes without a terminal response event", async (t) => {
   const upstream = await startUpstream(({ response, requests }) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
@@ -198,6 +220,31 @@ test("retries recoverable HTTP failures before forwarding a success", async (t) 
   assert.equal(upstream.requests.length, 2);
 });
 
+test("retries the exact upstream 503 api_error payload", async (t) => {
+  const upstream = await startUpstream(({ response, requests }) => {
+    if (requests.length === 1) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(`${JSON.stringify({
+        error: { message: "Service temporarily unavailable", type: "api_error" },
+      })} (after 3 attempts)`);
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(sse({ event: "response.completed", data: { type: "response.completed" } }));
+  });
+  const proxy = await createSseRetryProxy({
+    listenPort: 0,
+    upstreamOrigin: upstream.origin,
+    retryDelaysMs: [0],
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  t.after(async () => { await proxy.close(); await upstream.close(); });
+
+  const response = await fetch(`${proxy.url}/v1/responses`, { method: "POST", body: "{}" });
+  assert.equal(response.status, 200);
+  assert.equal(upstream.requests.length, 2);
+});
+
 test("forwards a non-recoverable failed SSE response without replay", async (t) => {
   const upstream = await startUpstream(({ response }) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
@@ -237,4 +284,74 @@ test("exposes a local health endpoint without contacting upstream", async (t) =>
   assert.equal(response.status, 200);
   assert.equal(await response.text(), "ok\n");
   assert.equal(upstream.requests.length, 0);
+});
+
+test("holds a Responses request behind a gate before contacting upstream", async (t) => {
+  const upstream = await startUpstream(({ response }) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(sse({ event: "response.completed", data: { type: "response.completed" } }));
+  });
+  let releaseGate;
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+  const proxy = await createSseRetryProxy({
+    listenPort: 0,
+    upstreamOrigin: upstream.origin,
+    requestGate: async () => gate,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  t.after(async () => { await proxy.close(); await upstream.close(); });
+
+  const responsePromise = fetch(`${proxy.url}/v1/responses`, { method: "POST", body: "{}" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(upstream.requests.length, 0);
+
+  releaseGate();
+  const response = await responsePromise;
+  assert.match(await response.text(), /response\.completed/);
+  assert.equal(upstream.requests.length, 1);
+});
+
+test("exposes model monitor state through the local status endpoint", async (t) => {
+  const upstream = await startUpstream(() => {
+    throw new Error("status probe must not reach upstream");
+  });
+  const proxy = await createSseRetryProxy({
+    listenPort: 0,
+    upstreamOrigin: upstream.origin,
+    statusProvider: () => ({ enabled: true, state: "offline", model: "gpt-5.6-sol" }),
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  t.after(async () => { await proxy.close(); await upstream.close(); });
+
+  const response = await fetch(`${proxy.url}/statusz`);
+  assert.deepEqual(await response.json(), {
+    enabled: true,
+    state: "offline",
+    model: "gpt-5.6-sol",
+  });
+  assert.equal(upstream.requests.length, 0);
+});
+
+test("passes the raw request to an optional observer without changing forwarding", async (t) => {
+  const upstream = await startUpstream(({ response }) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(sse({ event: "response.completed", data: { type: "response.completed" } }));
+  });
+  const observed = [];
+  const proxy = await createSseRetryProxy({
+    listenPort: 0,
+    upstreamOrigin: upstream.origin,
+    requestObserver: (request) => observed.push(request),
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  t.after(async () => { await proxy.close(); await upstream.close(); });
+
+  await (await fetch(`${proxy.url}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ thread_id: "thread-test", input: [] }),
+  })).text();
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].requestUrl, "/v1/responses");
+  assert.match(observed[0].body.toString(), /thread-test/);
 });

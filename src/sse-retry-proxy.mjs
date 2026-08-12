@@ -130,8 +130,9 @@ function errorEnvelopeText(eventName, payload) {
   });
 }
 
-export function classifyBufferedResponse({ status, contentType, body }) {
-  if (RECOVERABLE_HTTP_STATUSES.has(status)) {
+export function classifyBufferedResponse({ status, contentType, body, retryRules = null }) {
+  const matchesStatus = retryRules ? retryRules.matchesStatus(status) : RECOVERABLE_HTTP_STATUSES.has(status);
+  if (matchesStatus) {
     return { retryable: true, reason: `HTTP ${status}` };
   }
 
@@ -146,11 +147,11 @@ export function classifyBufferedResponse({ status, contentType, body }) {
         continue;
       }
       const errorText = errorEnvelopeText(event, payload);
-      if (errorText && RECOVERABLE_ERROR_PATTERN.test(errorText)) {
+      if (errorText && (retryRules ? retryRules.matchesText(errorText) : RECOVERABLE_ERROR_PATTERN.test(errorText))) {
         return { retryable: true, reason: `SSE ${event}` };
       }
     }
-    if (!events.some(({ event }) => TERMINAL_RESPONSE_EVENTS.has(event))) {
+    if (!events.some(({ event }) => TERMINAL_RESPONSE_EVENTS.has(event)) && (retryRules ? retryRules.matchesIncomplete() : true)) {
       return { retryable: true, reason: "SSE stream closed before response.completed" };
     }
     return { retryable: false, reason: null };
@@ -160,7 +161,7 @@ export function classifyBufferedResponse({ status, contentType, body }) {
     try {
       const payload = JSON.parse(bodyText);
       const errorText = errorEnvelopeText("json", payload);
-      if (errorText && RECOVERABLE_ERROR_PATTERN.test(errorText)) {
+      if (errorText && (retryRules ? retryRules.matchesText(errorText) : RECOVERABLE_ERROR_PATTERN.test(errorText))) {
         return { retryable: true, reason: "JSON error" };
       }
     } catch {
@@ -219,6 +220,10 @@ export async function createSseRetryProxy({
   maxBufferedResponseBytes = 64 * 1024 * 1024,
   fetchImpl = fetch,
   logger = console,
+  requestGate = null,
+  statusProvider = null,
+  requestObserver = null,
+  retryRules = null,
 } = {}) {
   const log = normalizeLogger(logger);
   if (!Array.isArray(retryDelaysMs) || retryDelaysMs.some((value) => !Number.isFinite(value) || value < 0)) {
@@ -229,6 +234,12 @@ export async function createSseRetryProxy({
     if (request.url === "/healthz" || request.url === "/readyz") {
       response.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
       response.end("ok\n");
+      return;
+    }
+    if (request.url === "/statusz") {
+      const status = statusProvider?.() ?? { enabled: false, state: "disabled" };
+      response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify(status));
       return;
     }
 
@@ -244,6 +255,7 @@ export async function createSseRetryProxy({
 
     try {
       const body = await readIncomingBody(request, maxRequestBytes);
+      requestObserver?.({ method: request.method, requestUrl: request.url, body });
       const upstreamUrl = buildUpstreamUrl(upstreamOrigin, request.url);
       const bufferForRetry = shouldBufferForRetry(request);
 
@@ -251,6 +263,15 @@ export async function createSseRetryProxy({
         let upstreamResponse;
         try {
           activeController = new AbortController();
+          if (bufferForRetry && requestGate) {
+            await requestGate({
+              attempt,
+              body,
+              method: request.method,
+              requestUrl: request.url,
+              signal: activeController.signal,
+            });
+          }
           upstreamResponse = await fetchImpl(upstreamUrl, {
             method: request.method,
             headers: requestHeaders(request),
@@ -261,7 +282,7 @@ export async function createSseRetryProxy({
         } catch (error) {
           activeController = null;
           if (clientClosed) return;
-          if (attempt >= retryDelaysMs.length || response.destroyed) throw error;
+          if ((retryRules && !retryRules.matchesText(error.message)) || attempt >= retryDelaysMs.length || response.destroyed) throw error;
           const waitMs = retryDelaysMs[attempt];
           log.warn(`Upstream request failed (${error.message}); retrying in ${waitMs} ms`);
           await delay(waitMs);
@@ -280,7 +301,7 @@ export async function createSseRetryProxy({
         } catch (error) {
           activeController = null;
           if (clientClosed) return;
-          if (attempt >= retryDelaysMs.length || response.destroyed) throw error;
+          if ((retryRules && !retryRules.matchesText(error.message)) || attempt >= retryDelaysMs.length || response.destroyed) throw error;
           const waitMs = retryDelaysMs[attempt];
           log.warn(`Upstream response stream failed (${error.message}); retrying in ${waitMs} ms`);
           await delay(waitMs);
@@ -299,6 +320,7 @@ export async function createSseRetryProxy({
           status: upstreamResponse.status,
           contentType: upstreamResponse.headers.get("content-type"),
           body: buffered.buffer,
+          retryRules,
         });
         if (!classification.retryable || attempt >= retryDelaysMs.length) {
           writeBufferedResponse(response, upstreamResponse, buffered.buffer);
